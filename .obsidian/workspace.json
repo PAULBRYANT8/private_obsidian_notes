@@ -37,12 +37,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/补充.md",
+                "file": "llm/deepseek/cp.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "补充"
+              "title": "cp"
             }
           }
         ],
@@ -211,6 +211,7 @@
   },
   "active": "3c39b3da615997d9",
   "lastOpenFiles": [
+    "sync.sh",
     "llm/deepseek/未命名.md",
     "llm/deepseek/补充.md",
     "llm/deepseek/cp.md",

@@ -256,3 +256,131 @@ DeepSeek-2026 CP 切分设计方案
 
   整体方案是可行且实现代价低的，主要工作量集中在 GetCompressTopkIdxs 的因果 mask
   修正和约束校验，其余复用现有的 allgather/reduce-scatter 基础设施即可。
+
+
+
+
+
+  ---                                                                                                    
+  压缩 token 的因果性问题
+                         
+  以 ratio=128 为例，压缩 token j 代表的是原始序列中第 j 组的 128 个 token，即原始位置 [j*128, (j+1)*128 
+  - 1]。                                                                                                 
+   
+  Query 位置 i 要访问压缩 token j，因果性要求这组 128 个 token 必须全部在 i                              
+  的过去（不包含未来信息）。判断条件是：
+                                                                                                         
+  压缩 token j 可见  ⟺  j < (i + 1) // 128
+                                                                                                         
+  直觉理解：(i+1) // 128 表示"到位置 i 为止，已经完整经过了几组 128 个                                   
+  token"。只有已完整经过的组才能作为压缩 token 被访问。                                                  
+                                                                                                         
+  举例（ratio=128，全局 seqlen=4096）：
+
+  ┌──────────────┬────────────┬─────────────────────────────────┐                                        
+  │ Query 位置 i │ (i+1)//128 │      可见的压缩 token 编号      │
+  ├──────────────┼────────────┼─────────────────────────────────┤                                        
+  │ 0            │ 0          │ 无（第一组还没完成）            │
+  ├──────────────┼────────────┼─────────────────────────────────┤
+  │ 127          │ 1          │ {0}（tokens 0-127 的压缩）      │                                        
+  ├──────────────┼────────────┼─────────────────────────────────┤                                        
+  │ 128          │ 1          │ {0}（token 128 还没完成第二组） │                                        
+  ├──────────────┼────────────┼─────────────────────────────────┤                                        
+  │ 255          │ 2          │ {0, 1}                          │
+  ├──────────────┼────────────┼─────────────────────────────────┤                                        
+  │ 511          │ 4          │ {0, 1, 2, 3}                    │
+  └──────────────┴────────────┴─────────────────────────────────┘                                        
+   
+  ---                                                                                                    
+  原始代码的逻辑（非 CP）
+
+  # model.py:435-438
+  def forward(self, ratio, bsz, seqlen, offset):                                                         
+      matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
+      mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio                                 
+      compress_topk = torch.where(mask, -1, matrix + offset)                                             
+   
+  具体展开（ratio=128, seqlen=4096, offset=4096）：                                                      
+                  
+  matrix: shape [4096, 32]，每行都是 [0, 1, 2, ..., 31]（32 个压缩 token 编号）                          
+                                                                                                         
+  torch.arange(1, 4097).unsqueeze(1) // 128 = [[0], [0], ..., [1], [1], ..., [32]]                       
+                                                  ^i=0   ^i=127 ^i=128        ^i=4095                    
+                                                                                                         
+  mask[i][j] = (j >= (i+1)//128)  ← True 表示 token j 对 query i 不可见（未来）                          
+                                                                                                         
+  compress_topk[i][j] = -1           if mask=True  （不可见，填 -1）                                     
+                       = j + offset  if mask=False （可见，填实际 kv_states 中的索引）
+                                                                                                         
+  offset = kv.size(1) = window KV 的长度，因为 kv_states = cat([window_kv, kv_compress]), 压缩 token j 在
+   kv_states 中的实际位置是 offset + j。                                                                 
+                                                                                                         
+  ---             
+  CP 下的问题
+                                                                                                         
+  以 seqlen=4096, cp=8, chunk_size=512, ratio=128 为例：
+                                                                                                         
+  - Rank 0 持有 token 0-511，本地位置 i 对应全局位置 i                                                   
+  - Rank 1 持有 token 512-1023，本地位置 i 对应全局位置 512+i
+                                                                                                         
+  非 CP 的代码在 Rank 1 上运行时，seqlen 变成了本地的 chunk_size=512：                                   
+                                                                                                         
+  matrix = [0, 1, 2, 3]（只有 4 个本地压缩 token）                                                       
+  mask[i][j] = (j >= (i+1) // 128)  ← 用的是本地位置 i，不是全局位置                                     
+                                                                                                         
+  Rank 1 本地位置 i=0 时（实际是全局 token 512）：                                                       
+  (0+1) // 128 = 0  →  所有 j>=0 都被掩盖  →  compress_topk = [-1, -1, -1, -1]                           
+                                                                                                         
+  结果：Rank 1 的第一个 token 看不到任何压缩 token！                                                     
+                                                                                                         
+  但实际上全局位置 512 的 token 应该能看到：                                                             
+  (512+1) // 128 = 4  →  压缩 token {0, 1, 2, 3} 均可见                                                  
+                                                                                                         
+  也就是说，Rank 0 那 512 个 token 对应的 4 个压缩 token（来自全局 kv_compress 的前 4                    
+  项）本应全部可见，却被错误地掩盖了。                                                                   
+                                                                                                         
+  ---                                                                                                    
+  修正方案        
+          
+  AllGather 之后，global_kv_compress 包含全局 32 个压缩 token，索引 0-31。需要用全局位置来计算因果 mask：
+                                                                                                         
+  global_compress_len = global_seqlen // ratio      # 4096//128 = 32
+  cp_rank_offset      = cp_rank * chunk_size        # rank 1: 512                                        
+                                                                                                         
+  # 本地 query i 的全局坐标 = cp_rank_offset + i                                                         
+  base_global = cp_rank_offset + torch.arange(chunk_size)  # [512, 513, ..., 1023]                       
+                                                                                                         
+  matrix = torch.arange(global_compress_len)        # [0, 1, ..., 31]
+                                                                                                         
+  # mask[i][j] = True 表示压缩 token j 对本地 query i 不可见                                             
+  mask = matrix.unsqueeze(0) >= (base_global.unsqueeze(1) + 1) // ratio
+                                                                                                         
+  compress_topk = torch.where(mask, -1, matrix + offset)
+                                                                                                         
+  Rank 1 本地位置 i=0 时（全局 512）的效果：                                                             
+  base_global[0] = 512
+  (512 + 1) // 128 = 4                                                                                   
+                      
+  mask[0] = [0>=4, 1>=4, 2>=4, 3>=4, 4>=4, 5>=4, ...]                                                    
+          = [F,    F,    F,    F,    T,    T,   ...]                                                     
+                                                                                                         
+  compress_topk[0] = [offset+0, offset+1, offset+2, offset+3, -1, -1, ..., -1]                           
+                                                                              
+  压缩 token 0, 1, 2, 3（来自全局 kv_compress 位置 offset+0 至 offset+3）均可见，后续的（来自 Rank 1     
+  自身的 token 组尚未完成）均被掩盖。这正是我们期望的结果。                                              
+   
+  ---                                                                                                    
+  直觉总结        
+          
+  ┌───────────────────────┬─────────────────┬─────────────────────┬─────────────────────────────────┐
+  │                       │      非 CP      │    CP 下错误行为    │            CP 修正后            │    
+  ├───────────────────────┼─────────────────┼─────────────────────┼─────────────────────────────────┤
+  │ matrix 的范围         │ [0, S//128)     │ [0, chunk//128)     │ [0, S//128) 全局                │    
+  │                       │ 全局            │ 本地                │                                 │
+  ├───────────────────────┼─────────────────┼─────────────────────┼─────────────────────────────────┤    
+  │ 因果 base             │ arange(S)       │ arange(chunk)       │ cp_rank*chunk + arange(chunk)   │    
+  │                       │ 全局位置        │ 本地位置            │ 全局位置                        │    
+  ├───────────────────────┼─────────────────┼─────────────────────┼─────────────────────────────────┤    
+  │ Rank 1 首 token       │ 正确 4          │ 错误 0              │ 正确 4                          │
+  │ 可见压缩数            │                 │                     │                                 │    
+  └───────────────────────┴─────────────────┴─────────────────────┴─────────────────────────────────┘

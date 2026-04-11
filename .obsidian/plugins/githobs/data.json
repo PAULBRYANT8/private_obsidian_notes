@@ -1,5 +1,11 @@
 {
   "version": 1,
-  "token": "",
-  "repos": []
+  "token": "https://github.com/PAULBRYANT8/private_obsidian_notes",
+  "repos": [
+    {
+      "owner": "",
+      "repo": "",
+      "code": ""
+    }
+  ]
 }
