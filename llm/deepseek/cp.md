@@ -445,28 +445,66 @@ def validate_c4a_cp_alignment(seq_len: int, cp_size: int) -> None:
       # 接收：左邻居末尾 1 个 group，用于填充本 rank new_tensor 位置 0
       # 
       # 通信量：[B, 1, ratio, d] = B × 4 × d 个元素（极小）
-      d = compressor.overlap_dim         # overlap_transform 所需的特征维度                                                                                                
-      send_slice = tensor[:, -1:, :, :d].contiguous()   # [B, 1, 4, d]                                                                                                         
-      recv_slice = boundary_exchange(send_slice, rank, cp_size, group)                                                                                                         
-      # recv_slice: [B, 1, 4, d]                                                                                                                                               
-      # rank 0 的 recv_slice 为全 0，与非 CP 下首位行为一致 ✓                                                                                                                  
-                                                                                                                                                                               
-      # ── Step 3：构造 overlap 后的 new_tensor ─────────────────────────────                                                                                                  
-      #                                                                                                                                                                        
-      # 非 CP 下 overlap_transform 的完整逻辑：                                                                                                                                
-      #   new_tensor[:, 0,  :ratio] = 0                        ← 首位无前驱                                                                                                    
-      #   new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]   ← 本地 shift                                                                                                     
-      #                                                                                                                                                                        
-      # CP 修正：将 new_tensor[:, 0] 从全 0 替换为左邻居的真实数据                                                                                                             
-      new_tensor = compressor.init_new_tensor(tensor)       # 按原始逻辑初始化（含全量 shift）                                                                                 
-      new_tensor[:, 0, :ratio] = recv_slice[:, 0, :, :d]   # ← CP 修正，rank 0 仍为全 0                                                                                        
-      # 位置 1 及之后：new_tensor[:, 1:, :ratio] 已由 init_new_tensor 正确填入本地数据                                                                                         
-                                                                                                                                                                               
-      # ── Step 4：压缩投影 ─────────────────────────────────────────────────                                                                                                  
-      local_kv_compress = compressor.compress_proj(new_tensor)                                                                                                                 
-      # [B, chunk//4, head_dim=512]                                                                                                                                            
-                                                                                                                                                                               
+      d = compressor.overlap_dim         # overlap_transform 所需的特征维度
+      send_slice = tensor[:, -1:, :, :d].contiguous()   # [B, 1, 4, d]
+      recv_slice = boundary_exchange(send_slice, rank, cp_size, group)
+      # recv_slice: [B, 1, 4, d]
+      # rank 0 的 recv_slice 为全 0，与非 CP 下首位行为一致 ✓
+      
+      # ── Step 3：构造 overlap 后的 new_tensor ────────────────────────────
+      #
+      # 非 CP 下 overlap_transform 的完整逻辑：
+      #   new_tensor[:, 0,  :ratio] = 0                        ← 首位无前驱
+      #   new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]   ← 本地 shift
+      # 
+      # CP 修正：将 new_tensor[:, 0] 从全 0 替换为左邻居的真实数据
+      new_tensor = compressor.init_new_tensor(tensor) # 按原始逻辑初始化（含全量 shift）
+      new_tensor[:, 0, :ratio] = recv_slice[:, 0, :, :d]   # ← CP 修正，rank 0 仍为全 0         
+      # 位置 1 及之后：new_tensor[:, 1:, :ratio] 已由 init_new_tensor 正确填入本地数据
+      
+      # ── Step 4：压缩投影 ────────────────────────────────────────────────
+      local_kv_compress = compressor.compress_proj(new_tensor)
+      # [B, chunk//4, head_dim=512]
       return local_kv_compress 
+```
+五、all-gather 压缩 kv
+```python
+class AllGatherCompressedKV(torch.autograd.Function):
+      """
+      Forward:  AllGather  local_kv  → global_kv
+      Backward: ReduceScatter grad   → grad_local
+      """
+      
+      @staticmethod
+      def forward(ctx, local_kv, group):
+          ctx.group   = group
+          ctx.cp_size = dist.get_world_size(group)
+
+          B, local_len, D = local_kv.shape
+          global_kv = torch.empty(
+              B, local_len * ctx.cp_size, D,
+              dtype=local_kv.dtype, device=local_kv.device,
+          )
+          dist.all_gather_into_tensor(
+              global_kv, local_kv.contiguous(), group=group
+          )       
+          return global_kv
+   
+      @staticmethod
+      def backward(ctx, grad_global):
+          B, global_len, D = grad_global.shape
+          local_len = global_len // ctx.cp_size
+          grad_local = torch.empty(
+              B, local_len, D,
+              dtype=grad_global.dtype, device=grad_global.device,
+          )
+          dist.reduce_scatter_tensor(
+              grad_local, grad_global.contiguous(), group=ctx.group
+          )       
+          return grad_local, None
+   
+  def allgather_kv_compress(local_kv, group):
+      return AllGatherCompressedKV.apply(local_kv, group)
 ```
 
   ---
