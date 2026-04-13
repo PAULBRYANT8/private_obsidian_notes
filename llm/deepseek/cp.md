@@ -512,6 +512,7 @@ class AllGatherCompressedKV(torch.autograd.Function):
 
 compressor：将原始 kv 压缩；
 	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
+			  k_indexer  [S/4, 128]
 
   ---
   五、各模块 CP 属性汇总
