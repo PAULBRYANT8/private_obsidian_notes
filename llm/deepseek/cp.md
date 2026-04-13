@@ -507,6 +507,12 @@ class AllGatherCompressedKV(torch.autograd.Function):
       return AllGatherCompressedKV.apply(local_kv, group)
 ```
 
+
+六、c4a 需要分成 compressor 和 indexer 的原因
+
+compressor：将原始 kv 压缩；
+	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
+
   ---
   五、各模块 CP 属性汇总
 
