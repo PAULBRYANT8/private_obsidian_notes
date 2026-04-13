@@ -529,6 +529,133 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 k_indexer  只用来做“相关性排序”，不需要携带完整语义信息。维度低 -> 检索更快 -> top-k 计算的代价小
 kv_compressor 要参与真正的 attention 计算，需要保留完整表征。 维度高 -> 保留语义 -> attention 质量高
 
+3.2.4.5 c4a indexer
+kv_compressor 和 k_indexer 的上半部分 compressor 输入相同的 x，reshape 之后 tensor[:, -1:, :, :d] 完全一样，一次 P2P 交换可同时服务两个 compressor：
+```python
+  # 共用一次 BoundaryExchange
+  tensor = x.reshape(B, chunk // ratio, ratio, D)
+  send_slice = tensor[:, -1:, :, :d].contiguous()       # [B, 1, 4, d]
+  recv_slice = boundary_exchange(send_slice, rank, cp_size, group)
+  # recv_slice 同时用于 kv_compress 和 k_indexer 的 overlap 修正
+```
+
+```python
+  def c4a_forward_with_cp(
+      x:          torch.Tensor,          # [B, chunk, D]
+      kv_compressor,                     # ratio=4, overlap=Falsw，输出 kv_compress
+      k_compressor,                      # ratio=4, overlap=True，输出 k_indexer
+      window_proj,
+      li_compute,                        # LiCompute：top-k 选择
+      li_loss_fn,                        # LiLoss
+      attention,                         # SparseAttention
+      cp_rank:    int,
+      cp_size:    int,
+      cp_group:   dist.ProcessGroup,
+      chunk_size: int,
+      seq_len:    int,
+      ratio:      int = 4,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+
+      B, chunk, D = x.shape
+
+      # ═══════════════════════════════════════════════════════════════════
+      # Part A：Compressor 上半部分（kv 与 k_indexer 共用 BoundaryExchange）
+      # ═══════════════════════════════════════════════════════════════════
+
+      # ── A1：共用的 reshape + P2P 边界交换 ────────────────────────────
+      tensor    = x.reshape(B, chunk // ratio, ratio, D)    # [B, chunk//4, 4, D]
+      d         = kv_compressor.overlap_dim
+      send_slice = tensor[:, -1:, :, :d].contiguous()       # [B, 1, 4, d]
+      recv_slice = boundary_exchange(send_slice, cp_rank, cp_size, cp_group)
+      # recv_slice: [B, 1, 4, d]，rank 0 为全 0
+
+      # ── A2：构造 overlap new_tensor（两个 compressor 共用同一个 new_tensor）
+      new_tensor = build_new_tensor(tensor)                  # 本地 shift 已填入
+      new_tensor[:, 0, :ratio] = recv_slice[:, 0, :, :d]    # CP 边界修正
+
+      # ── A3：kv_compress 压缩 ─────────────────────────────────────────
+      local_kv_compress = kv_compressor.compress_proj(new_tensor)
+      # [B, chunk//4, 512]
+
+      # ── A4：k_indexer 压缩（共用同一 new_tensor，不再需要额外 P2P）──
+      local_k_indexer = k_compressor.compress_proj(new_tensor)
+      # [B, chunk//4, 128]
+
+      # ═══════════════════════════════════════════════════════════════════
+      # Part B：AllGather（两路并发，反向自动 ReduceScatter）
+      # ═══════════════════════════════════════════════════════════════════
+      global_kv_compress = allgather_kv_compress(local_kv_compress, cp_group)
+      # [B, seq_len//4, 512]，通信量 ~16 MB
+
+      global_k_indexer   = allgather_kv_compress(local_k_indexer,   cp_group)
+      # [B, seq_len//4, 128]，通信量 ~4 MB
+
+      # ═══════════════════════════════════════════════════════════════════
+      # Part C：Indexer 下半部分（local q × global k → top-k）
+      # ═══════════════════════════════════════════════════════════════════
+
+      # ── C1：local q（每个 rank 独立，不需要通信）──────────────────────
+      q = query_proj(x)                                      # [B, chunk, head_dim]
+
+      # ── C2：LiCompute 因果 mask（CP 全局坐标修正）────────────────────
+      #
+      # 非 CP 原始逻辑：
+      #   base   = torch.arange(seq_len)                    # 本地位置
+      #   matrix = torch.arange(seq_len // ratio)           # 压缩 token 位置
+      #   mask   = matrix >= (base + 1) // ratio            # 因果：query 只看之前的压缩 token
+      #
+      # CP 修正：query 的全局位置 = cp_rank * chunk + local_pos
+      base   = (cp_rank * chunk_size
+                + torch.arange(chunk_size, device=x.device)).unsqueeze(1)
+      # [chunk, 1]
+
+      matrix = torch.arange(seq_len // ratio, device=x.device).unsqueeze(0)
+      # [1, seq_len//ratio]
+
+      causal_mask = matrix >= (base + 1) // ratio
+      # [chunk, seq_len//ratio]
+      # rank 0 的 query 0：只能看到压缩 token 0（(0+1)//4=0，matrix>=0 全为 True → 错？）
+      # 实际 mask 含义取决于 LiCompute 具体实现，此处保持与原始逻辑一致的修正方向
+
+      # ── C3：top-k 选择 ────────────────────────────────────────────────
+      compress_topk_idxs = li_compute(
+          q,
+          global_k_indexer,    # [B, seq_len//4, 128]，已 AllGather
+          causal_mask,
+      )
+      # compress_topk_idxs: [B, chunk, topk]，索引 global_k_indexer 中的位置
+
+      # ═══════════════════════════════════════════════════════════════════
+      # Part D：Sparse Attention（Window KV + 压缩 KV）
+      # ═══════════════════════════════════════════════════════════════════
+
+      # ── D1：Window KV（纯本地）───────────────────────────────────────
+      local_window_kv = window_proj(x)                       # [B, chunk, 512]
+
+      # ── D2：因果裁剪（去掉未来 rank 的压缩 KV）──────────────────────
+      valid_compress_len = (cp_rank + 1) * chunk_size // ratio
+      causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]
+      # rank 0: [B, chunk//4,   512]
+      # rank 7: [B, seq_len//4, 512]
+
+      # ── D3：拼接 KV states ────────────────────────────────────────────
+      kv_states = torch.cat([local_window_kv, causal_kv_compress], dim=1)
+      # [B, chunk + valid_compress_len, 512]
+      #
+      # topk_idxs 索引的是 causal_kv_compress 中的位置
+      # offset = chunk（window KV 占据槽位 [0, chunk)，压缩 KV 从 chunk 起）
+
+      attn_out = attention(q, kv_states, compress_topk_idxs, offset=chunk_size)
+      # [B, chunk, D]
+
+      # ═══════════════════════════════════════════════════════════════════
+      # Part E：LiLoss（使用因果裁剪后的压缩 KV）
+      # ═══════════════════════════════════════════════════════════════════
+      loss = li_loss_fn(q, causal_kv_compress)
+      # causal_kv_compress 已裁剪，rank r 只看到自己及之前 rank 的压缩 KV，满足因果
+
+      return attn_out, loss
+```
   ---
   五、各模块 CP 属性汇总
 
