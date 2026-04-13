@@ -326,27 +326,6 @@ new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
   loss = li_loss(q, global_kv_compress[:, :valid_compress_len], ...)
 
   ---
-  四、整体数据流（C4A 层）
-
-  输入 x: (B, chunk, D)
-      │
-      ├─ [P2P Recv 4 tokens from prev_rank]
-      │
-      ├─ 1. 计算 window KV       (B, chunk, head_dim)       ← 纯本地
-      │
-      ├─ 2. Compressor (含边界)  → local_kv_compress (B, chunk/4, head_dim)
-      │
-      ├─ 3. Indexer              → local_k_indexer  (B, chunk/4, index_head_dim)
-      │
-      ├─ 4. AllGather ──────────────────────────────────────────────────────┐
-      │         global_kv_compress (B, seqlen/4, head_dim)                 │
-      │         global_k_indexer   (B, seqlen/4, index_head_dim)           │ 反向: ReduceScatter
-      │                                                                      │
-      ├─ 5. LiCompute(global_k_indexer, global 因果 mask) → compress_topk_idxs
-      │
-      ├─ 6. SparseAttention(window_kv ∥ global_kv_compress, compress_topk_idxs)
-      │
-      └─ 7. LiLoss(global_kv_compress[:valid], ...)
 
 
 3.2.4.4 C4A compressor 方案
@@ -360,153 +339,206 @@ new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
 
 二、对齐约束
 ```python
-def validate_c4a_cp_alignment(seq_len: int, cp_size: int) -> None:
-    ratio = 4
-    if seq_len % (cp_size * ratio) != 0:
-        raise NotImplementedError(
-            f"C4A requires seq_len % (cp_size * {ratio}) == 0. " 
-            f"Got seq_len={seq_len}, cp_size={cp_size}, "
-            f"remainder={seq_len % (cp_size * ratio)}."
-        )
+  def validate_c4a_cp_alignment(seq_len: int, cp_size: int) -> None:
+      if seq_len % (cp_size * 4) != 0:
+          raise NotImplementedError(
+              f"C4A requires seq_len % (cp_size * 4) == 0. "
+              f"Got seq_len={seq_len}, cp_size={cp_size}."
+          )
 ```
 
-三、通用 P2P 边界交换模块
-与 Window attention 共用同一模块，仅传入的tensor形状不同。
+三、通用 BoundaryExchange （复用）
 ```python
   class BoundaryExchange(torch.autograd.Function):
-      """
-      Forward:  rank i-1 将 send_tensor 发给 rank i
-      Backward: rank i 将梯度发回 rank i-1 累加
-      边界处理：
-        rank 0         ：无前驱，recv_buf 保持全 0（隐式正确）
-        rank cp_size-1 ：无后继，只接收不发送
-      """
-      
       @staticmethod
       def forward(ctx, send_tensor, rank, cp_size, group):
-          ctx.rank    = rank
-          ctx.cp_size = cp_size
-          ctx.group   = group
+          ctx.rank, ctx.cp_size, ctx.group = rank, cp_size, group
           recv_buf = torch.zeros_like(send_tensor)
           reqs = []
-          
           if rank < cp_size - 1:
-              reqs.append(dist.isend(
-                  send_tensor.contiguous(), dst=rank + 1, group=group
-              ))
+              reqs.append(dist.isend(send_tensor.contiguous(), dst=rank+1, group=group))
           if rank > 0:
-              reqs.append(dist.irecv(
-                  recv_buf, src=rank - 1, group=group
-              ))
-          for req in reqs:
-              req.wait()
+              reqs.append(dist.irecv(recv_buf, src=rank-1, group=group))
+          for req in reqs: req.wait()
+          return recv_buf
 
-          return recv_buf 
-   
       @staticmethod
       def backward(ctx, grad_recv):
           grad_send = torch.zeros_like(grad_recv)
-
           reqs = []
           if ctx.rank > 0:
-              reqs.append(dist.isend(
-                  grad_recv.contiguous(), dst=ctx.rank - 1, group=ctx.group
-              ))
-
+              reqs.append(dist.isend(grad_recv.contiguous(), dst=ctx.rank-1, group=ctx.group))
           if ctx.rank < ctx.cp_size - 1:
-              reqs.append(dist.irecv(
-                  grad_send, src=ctx.rank + 1, group=ctx.group
-              ))
-          for req in reqs:
-              req.wait()
-
+              reqs.append(dist.irecv(grad_send, src=ctx.rank+1, group=ctx.group))
+          for req in reqs: req.wait()
           return grad_send, None, None, None
-  def boundary_exchange(send_tensor, rank, cp_size, group):
-      return BoundaryExchange.apply(send_tensor, rank, cp_size, group)               
 ```
-四、c4a compressor 前向（含 cp 边界修正）
+
+三、带 cp 边界修正的 compressor 前向
+
 ```python
-  def c4a_compressor_with_cp(
-      x:        torch.Tensor,   # [B, chunk, D]
-      compressor,               # ratio=4, overlap=True 的 Compressor 实例
-      rank:     int,
-      cp_size:  int,
-      group:    dist.ProcessGroup,
-      ratio:    int = 4,
-  ) -> torch.Tensor:            # [B, chunk//4, head_dim]
+ def compressor_forward_with_cp(
+      compressor,          # Compressor 实例（overlap=True）
+      x,                   # [B, chunk, D]
+      freqs_cis_global,    # 全量 freqs_cis，[max_seq_len, rope_head_dim]
+      cp_rank, cp_size, cp_group,
+      chunk_size, ratio=4,
+  ):
       B, chunk, D = x.shape
-      # ── Step 1：reshape 为 group 视图 ───────────────────────────────────
-      tensor = x.reshape(B, chunk // ratio, ratio, D)
-      # [B, chunk//4, 4, D]
-      
-      # ── Step 2：P2P 交换边界 group ──────────────────────────────────────
-      #
-      # 发送：本 rank 末尾 1 个 group（reshape 空间，非原始 token 空间）
-      # 接收：左邻居末尾 1 个 group，用于填充本 rank new_tensor 位置 0
-      # 
-      # 通信量：[B, 1, ratio, d] = B × 4 × d 个元素（极小）
-      d = compressor.overlap_dim         # overlap_transform 所需的特征维度
-      send_slice = tensor[:, -1:, :, :d].contiguous()   # [B, 1, 4, d]
-      recv_slice = boundary_exchange(send_slice, rank, cp_size, group)
-      # recv_slice: [B, 1, 4, d]
-      # rank 0 的 recv_slice 为全 0，与非 CP 下首位行为一致 ✓
-      
-      # ── Step 3：构造 overlap 后的 new_tensor ────────────────────────────
-      #
-      # 非 CP 下 overlap_transform 的完整逻辑：
-      #   new_tensor[:, 0,  :ratio] = 0                        ← 首位无前驱
-      #   new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]   ← 本地 shift
-      # 
-      # CP 修正：将 new_tensor[:, 0] 从全 0 替换为左邻居的真实数据
-      new_tensor = compressor.init_new_tensor(tensor) # 按原始逻辑初始化（含全量 shift）
-      new_tensor[:, 0, :ratio] = recv_slice[:, 0, :, :d]   # ← CP 修正，rank 0 仍为全 0         
-      # 位置 1 及之后：new_tensor[:, 1:, :ratio] 已由 init_new_tensor 正确填入本地数据
-      
-      # ── Step 4：压缩投影 ────────────────────────────────────────────────
-      local_kv_compress = compressor.compress_proj(new_tensor)
-      # [B, chunk//4, head_dim=512]
-      return local_kv_compress 
+      d = compressor.head_dim
+      dtype = x.dtype
+      x_f = x.float()
+
+      # ── Step 1：投影 ─────────────────────────────────────────────────────
+      kv    = compressor.wkv(x_f)    # [B, chunk, 2*head_dim]
+      score = compressor.wgate(x_f)  # [B, chunk, 2*head_dim]
+
+      # ── Step 2：截断尾部（chunk%ratio==0 时无截断） ───────────────────────
+      cutoff = (chunk // ratio) * ratio
+      if cutoff < chunk:
+          kv    = kv[:, :cutoff]
+          score = score[:, :cutoff]
+
+      # ── Step 3：reshape 为 group 视图 ────────────────────────────────────
+      kv_g    = kv.unflatten(1, (-1, ratio))  # [B, chunk//4, 4, 2*d]
+      score_g = score.unflatten(1, (-1, ratio)) + compressor.ape  # [B, chunk//4, 4, 2*d]
+
+      # ── Step 4：P2P 边界交换（kv + score 拼在一起，一次通信）────────────
+      # 发送：本 rank 末尾 group 的前 d 维（将被 shift 给下一 rank 的位置 0）
+      kv_last    = kv_g[:, -1:, :, :d]     # [B, 1, 4, d]
+      score_last = score_g[:, -1:, :, :d]  # [B, 1, 4, d]
+      send_slice = torch.cat([kv_last, score_last], dim=-1).contiguous()  # [B, 1, 4, 2*d]
+
+      recv_slice = BoundaryExchange.apply(send_slice, cp_rank, cp_size, cp_group)
+      # recv_slice: [B, 1, 4, 2*d]，rank 0 为全 0（kv 部分）和全 0（score 部分）
+
+      recv_kv    = recv_slice[:, :, :, :d]   # [B, 1, 4, d]
+      recv_score = recv_slice[:, :, :, d:]   # [B, 1, 4, d]
+
+      # ── Step 5：手动执行 overlap_transform（带 CP 边界修正）────────────────
+      s = chunk // ratio
+      new_kv    = kv_g.new_full((B, s, 2*ratio, d), 0.)
+      new_score = score_g.new_full((B, s, 2*ratio, d), float("-inf"))
+
+      # 正常部分（不涉及跨 rank）
+      new_kv[:, :, ratio:]    = kv_g[:, :, :, d:]
+      new_score[:, :, ratio:] = score_g[:, :, :, d:]
+
+      # overlap 本地 shift（位置 1 及之后）
+      new_kv[:, 1:, :ratio]    = kv_g[:, :-1, :, :d]
+      new_score[:, 1:, :ratio] = score_g[:, :-1, :, :d]
+
+      # CP 边界修正（位置 0）
+      new_kv[:, 0, :ratio]    = recv_kv[:, 0]    # rank 0 为全 0 ✓
+      new_score[:, 0, :ratio] = recv_score[:, 0]  # rank 0 为全 0（softmax 后趋近均匀，
+                                                  # 行为与非 CP rank 0 一致）
+
+      # ── Step 6：压缩 ─────────────────────────────────────────────────────
+      out = (new_kv * new_score.softmax(dim=2)).sum(dim=2)  # [B, chunk//4, d]
+      out = compressor.norm(out.to(dtype))
+
+      # ── Step 7：RoPE（使用全局位置） ─────────────────────────────────────
+      # 非 CP：freqs_cis[:cutoff:ratio]（局部 0~chunk 位置）
+      # CP：  freqs_cis[cp_rank*chunk : (cp_rank+1)*chunk : ratio]（全局位置）
+      global_start = cp_rank * chunk_size
+      freqs_compress = freqs_cis_global[global_start : global_start + cutoff : ratio]
+      kv_rot = apply_rotary_emb(out[..., -compressor.rope_head_dim:], freqs_compress)
+      out = torch.cat([out[..., :-compressor.rope_head_dim], kv_rot], dim=-1)
+
+      return out   # [B, chunk//4, head_dim]
 ```
-五、all-gather 压缩 kv
+
+四、indexer 前向（两个 Compressor 相互独立 BoundaryExchange ）
 ```python
-class AllGatherCompressedKV(torch.autograd.Function):
-      """
-      Forward:  AllGather  local_kv  → global_kv
-      Backward: ReduceScatter grad   → grad_local
-      """
-      
-      @staticmethod
-      def forward(ctx, local_kv, group):
-          ctx.group   = group
-          ctx.cp_size = dist.get_world_size(group)
+ def indexer_forward_with_cp(
+      indexer,             # Indexer 实例
+      x, qr,              # x: [B,chunk,D]，qr: [B,chunk,q_lora_rank]
+      freqs_cis_global,
+      cp_rank, cp_size, cp_group,
+      chunk_size, ratio=4,
+  ):
+      B, chunk, _ = x.shape
 
-          B, local_len, D = local_kv.shape
-          global_kv = torch.empty(
-              B, local_len * ctx.cp_size, D,
-              dtype=local_kv.dtype, device=local_kv.device,
-          )
-          dist.all_gather_into_tensor(
-              global_kv, local_kv.contiguous(), group=group
-          )       
-          return global_kv
-   
-      @staticmethod
-      def backward(ctx, grad_global):
-          B, global_len, D = grad_global.shape
-          local_len = global_len // ctx.cp_size
-          grad_local = torch.empty(
-              B, local_len, D,
-              dtype=grad_global.dtype, device=grad_global.device,
-          )
-          dist.reduce_scatter_tensor(
-              grad_local, grad_global.contiguous(), group=ctx.group
-          )       
-          return grad_local, None
-   
-  def allgather_kv_compress(local_kv, group):
-      return AllGatherCompressedKV.apply(local_kv, group)
+      # ── 上半部分：k_indexer（indexer 内部的 Compressor，overlap=True）───
+      # 使用同一个 compressor_forward_with_cp，只是参数实例不同
+      k_indexer = compressor_forward_with_cp(
+          indexer.compressor, x, freqs_cis_global,
+          cp_rank, cp_size, cp_group, chunk_size, ratio,
+      )  # [B, chunk//4, index_head_dim]
+      k_indexer = rotate_activation(k_indexer)  # Hadamard 旋转
+
+      # ── 下半部分：q_indexer 和 weights（纯本地，不需要通信）────────────
+      rd = indexer.rope_head_dim
+      q = indexer.wq_b(qr).view(B, chunk, indexer.n_heads, indexer.head_dim)
+      q = q.clone()
+      q_nope, q_rope = torch.split(q, [indexer.head_dim - rd, rd], dim=-1)
+
+      # freqs_cis 也需要用全局位置
+      global_start = cp_rank * chunk_size
+      freqs_local = freqs_cis_global[global_start : global_start + chunk]
+      q_rope = apply_rotary_emb(q_rope, freqs_local)
+      q_indexer = torch.cat([q_nope, q_rope], dim=-1)
+      q_indexer = rotate_activation(q_indexer)
+
+      weights = indexer.weights_proj(x) * (indexer.softmax_scale * indexer.n_heads ** -0.5)
+
+      return q_indexer, k_indexer, weights
+      # q_indexer: [B, chunk, n_heads, index_head_dim]（本地，不需要 AllGather）
+      # k_indexer: [B, chunk//4, index_head_dim]（需要 AllGather）
+      # weights:   [B, chunk, n_heads]（本地）
 ```
 
+五、all-gather （复用 c128）
+```python
+  # 两路 AllGather，反向自动 ReduceScatter
+  global_kv_compress = AllGatherCompressedKV.apply(local_kv_compress, cp_group)
+  # [B, seq_len//4, head_dim]
+
+  global_k_indexer = AllGatherCompressedKV.apply(local_k_indexer, cp_group)
+  # [B, seq_len//4, index_head_dim]
+```
+
+六、LiCompute CP 修正
+
+```python
+  def li_compute_with_cp(
+      li_compute,          # LiCompute 实例
+      q_indexer,           # [B, chunk, n_heads, index_head_dim]（本地）
+      global_k_indexer,    # [B, seq_len//4, index_head_dim]（AllGather 后）
+      weights,             # [B, chunk, n_heads]（本地）
+      chunk_size, seq_len, cp_rank, ratio, offset,
+  ):
+      # 计算 attention 分数
+      index_score = torch.einsum("bshd,btd->bsht", q_indexer, global_k_indexer)
+      index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+      # index_score: [B, chunk, seq_len//4]
+
+      # ── CP 修正：base 使用全局坐标 ──────────────────────────────────────
+      # 原始代码：base = arange(seqlen)
+      # CP 修正：rank r 的 query 全局位置是 cp_rank*chunk + local_pos
+      device = index_score.device
+      base = (cp_rank * chunk_size
+              + torch.arange(chunk_size, device=device)).unsqueeze(1)  # [chunk, 1]
+
+      # matrix 扩展到全局压缩长度
+      matrix = torch.arange(seq_len // ratio, device=device).unsqueeze(0)  # [1, seq_len//4]
+
+      causal_mask = matrix >= (base + 1) // ratio   # [chunk, seq_len//4]
+      index_score = index_score + torch.where(
+          causal_mask, torch.finfo(q_indexer.dtype).min, 0.
+      )
+
+      # topk 上限：rank r 最多能看到 (cp_rank+1)*chunk//ratio 个压缩 token
+      max_valid = (cp_rank + 1) * chunk_size // ratio
+      k = min(li_compute.index_topk, max_valid)
+      index_score, topk_idxs = index_score.topk(k, dim=-1)
+
+      # 因果检查 + 加 offset
+      mask = topk_idxs >= (base + 1) // ratio
+      compress_topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+
+      return compress_topk_idxs, index_score
+```
 
 六、c4a 需要分成 compressor 和 indexer 的原因
 
@@ -542,7 +574,7 @@ kv_compressor 和 k_indexer 的上半部分 compressor 输入相同的 x，resha
 ```python
   def c4a_forward_with_cp(
       x:          torch.Tensor,          # [B, chunk, D]
-      kv_compressor,                     # ratio=4, overlap=Falsw，输出 kv_compress
+      kv_compressor,                     # ratio=4, overlap=True，输出 kv_compress
       k_compressor,                      # ratio=4, overlap=True，输出 k_indexer
       window_proj,
       li_compute,                        # LiCompute：top-k 选择
