@@ -512,7 +512,22 @@ class AllGatherCompressedKV(torch.autograd.Function):
 
 compressor：将原始 kv 压缩；
 	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
-			  k_indexer  [S/4, 128]
+			  k_indexer  [S/4, 128]  ->  检索用的轻量 kv
+indexer：在压缩 KV 中找出最相关的 top-k；
+	q    [chunk, head_dim]
+		👇
+	k_indexer [S/4, 128]  <-  轻量 key
+		👇
+	计算相关性分数（无 softmax，轻量）
+		👇
+	top-k 位置索引
+		👇
+	用索引从  kv_compressor 中取出 top-k 行
+		👇
+	只对这 k 个位置做 attention
+
+k_indexer  只用来做“相关性排序”，不需要携带完整语义信息。维度低 -> 检索更快 -> top-k 计算的代价小
+kv_compressor 要参与真正的 attention 计算，需要保留完整表征。 维度高 -> 保留语义 -> attention 质量高
 
   ---
   五、各模块 CP 属性汇总
