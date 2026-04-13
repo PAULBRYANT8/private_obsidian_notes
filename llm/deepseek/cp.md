@@ -270,6 +270,13 @@ def allgather_kv_compress(
                           
 
   3.3 ratio=4：C4A（最复杂，需分步处理）
+```python
+# overlap_transform 的关键一行
+new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+#           ↑ 位置 1 到末尾     ↑ 位置 0 到倒数第二
+#            
+# 含义：第 i 个压缩 token 的输入，混入了第 i-1 个 group 的数据
+```
 
   Step 1：Overlap 边界通信
 
@@ -340,6 +347,127 @@ def allgather_kv_compress(
       ├─ 6. SparseAttention(window_kv ∥ global_kv_compress, compress_topk_idxs)
       │
       └─ 7. LiLoss(global_kv_compress[:valid], ...)
+
+
+3.2.4.4 C4A compressor 方案
+ 一、问题定位                                                                                                                                                                 
+   
+  C4A compressor 使用 overlap=True，其 overlap_transform 使第 i 个压缩 token 依赖第 i-1 个 group 的数据：
+  new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]  # group i 混入 group i-1 的数据
+  CP 切分后，rank r 的 compressed_token[0] 需要 rank r-1 最后一个 group 的数据，但本地看不到，导致错误地填入全 0：
+  非 CP（正确）：  compressed[0 of rank r] = f(group_k,  group_{k-1})  ✓
+  CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
+
+二、对齐约束
+```python
+def validate_c4a_cp_alignment(seq_len: int, cp_size: int) -> None:
+    ratio = 4
+    if seq_len % (cp_size * ratio) != 0:
+        raise NotImplementedError(
+            f"C4A requires seq_len % (cp_size * {ratio}) == 0. " 
+            f"Got seq_len={seq_len}, cp_size={cp_size}, "
+            f"remainder={seq_len % (cp_size * ratio)}."
+        )
+```
+
+三、通用 P2P 边界交换模块
+与 Window attention 共用同一模块，仅传入的tensor形状不同。
+```python
+  class BoundaryExchange(torch.autograd.Function):
+      """
+      Forward:  rank i-1 将 send_tensor 发给 rank i
+      Backward: rank i 将梯度发回 rank i-1 累加
+      边界处理：
+        rank 0         ：无前驱，recv_buf 保持全 0（隐式正确）
+        rank cp_size-1 ：无后继，只接收不发送
+      """
+      
+      @staticmethod
+      def forward(ctx, send_tensor, rank, cp_size, group):
+          ctx.rank    = rank
+          ctx.cp_size = cp_size
+          ctx.group   = group
+          recv_buf = torch.zeros_like(send_tensor)
+          reqs = []
+          
+          if rank < cp_size - 1:
+              reqs.append(dist.isend(
+                  send_tensor.contiguous(), dst=rank + 1, group=group
+              ))
+          if rank > 0:
+              reqs.append(dist.irecv(
+                  recv_buf, src=rank - 1, group=group
+              ))
+          for req in reqs:
+              req.wait()
+
+          return recv_buf 
+   
+      @staticmethod
+      def backward(ctx, grad_recv):
+          grad_send = torch.zeros_like(grad_recv)
+
+          reqs = []
+          if ctx.rank > 0:
+              reqs.append(dist.isend(
+                  grad_recv.contiguous(), dst=ctx.rank - 1, group=ctx.group
+              ))
+
+          if ctx.rank < ctx.cp_size - 1:
+              reqs.append(dist.irecv(
+                  grad_send, src=ctx.rank + 1, group=ctx.group
+              ))
+          for req in reqs:
+              req.wait()
+
+          return grad_send, None, None, None
+  def boundary_exchange(send_tensor, rank, cp_size, group):
+      return BoundaryExchange.apply(send_tensor, rank, cp_size, group)               
+```
+四、c4a compressor 前向（含 cp 边界修正）
+```python
+  def c4a_compressor_with_cp(
+      x:        torch.Tensor,   # [B, chunk, D]
+      compressor,               # ratio=4, overlap=True 的 Compressor 实例
+      rank:     int,
+      cp_size:  int,
+      group:    dist.ProcessGroup,
+      ratio:    int = 4,
+  ) -> torch.Tensor:            # [B, chunk//4, head_dim]
+      B, chunk, D = x.shape
+      # ── Step 1：reshape 为 group 视图 ───────────────────────────────────
+      tensor = x.reshape(B, chunk // ratio, ratio, D)
+      # [B, chunk//4, 4, D]
+      
+      # ── Step 2：P2P 交换边界 group ──────────────────────────────────────
+      #
+      # 发送：本 rank 末尾 1 个 group（reshape 空间，非原始 token 空间）
+      # 接收：左邻居末尾 1 个 group，用于填充本 rank new_tensor 位置 0
+      # 
+      # 通信量：[B, 1, ratio, d] = B × 4 × d 个元素（极小）
+      d = compressor.overlap_dim         # overlap_transform 所需的特征维度                                                                                                
+      send_slice = tensor[:, -1:, :, :d].contiguous()   # [B, 1, 4, d]                                                                                                         
+      recv_slice = boundary_exchange(send_slice, rank, cp_size, group)                                                                                                         
+      # recv_slice: [B, 1, 4, d]                                                                                                                                               
+      # rank 0 的 recv_slice 为全 0，与非 CP 下首位行为一致 ✓                                                                                                                  
+                                                                                                                                                                               
+      # ── Step 3：构造 overlap 后的 new_tensor ─────────────────────────────                                                                                                  
+      #                                                                                                                                                                        
+      # 非 CP 下 overlap_transform 的完整逻辑：                                                                                                                                
+      #   new_tensor[:, 0,  :ratio] = 0                        ← 首位无前驱                                                                                                    
+      #   new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]   ← 本地 shift                                                                                                     
+      #                                                                                                                                                                        
+      # CP 修正：将 new_tensor[:, 0] 从全 0 替换为左邻居的真实数据                                                                                                             
+      new_tensor = compressor.init_new_tensor(tensor)       # 按原始逻辑初始化（含全量 shift）                                                                                 
+      new_tensor[:, 0, :ratio] = recv_slice[:, 0, :, :d]   # ← CP 修正，rank 0 仍为全 0                                                                                        
+      # 位置 1 及之后：new_tensor[:, 1:, :ratio] 已由 init_new_tensor 正确填入本地数据                                                                                         
+                                                                                                                                                                               
+      # ── Step 4：压缩投影 ─────────────────────────────────────────────────                                                                                                  
+      local_kv_compress = compressor.compress_proj(new_tensor)                                                                                                                 
+      # [B, chunk//4, head_dim=512]                                                                                                                                            
+                                                                                                                                                                               
+      return local_kv_compress 
+```
 
   ---
   五、各模块 CP 属性汇总
