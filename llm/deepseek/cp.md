@@ -141,134 +141,132 @@ DeepSeek-2026 CP 切分设计方案
 ```python
 class AllGatherCompressedKV(torch.autograd.Function):
       """         
-      前向：AllGather local_kv_compress → global_kv_compress                                                                                                                   
+      前向：AllGather local_kv_compress → global_kv_compress
       反向：ReduceScatter grad_global   → grad_local
-      """                                                                                                                                                                      
-                  
-      @staticmethod                                                                                                                                                            
+      """
+      
+      @staticmethod
       def forward(
           ctx,
           local_kv: torch.Tensor,   # [B, chunk//128, 512]
-          group: dist.ProcessGroup,                                                                                                                                            
+          group: dist.ProcessGroup,
       ) -> torch.Tensor:            # [B, seq_len//128, 512]
-          ctx.group = group                                                                                                                                                    
+          ctx.group = group
           ctx.cp_size = dist.get_world_size(group)
-                                                                                                                                                                               
-          B, local_len, D = local_kv.shape                                                                                                                                     
+          
+          B, local_len, D = local_kv.shape
           global_kv = torch.empty(
-              B, local_len * ctx.cp_size, D,                                                                                                                                   
-              dtype=local_kv.dtype,                                                                                                                                            
+              B, local_len * ctx.cp_size, D,
+              dtype=local_kv.dtype,
               device=local_kv.device,
-          )                                                                                                                                                                    
-          dist.all_gather_into_tensor(
-              global_kv, local_kv.contiguous(), group=group                                                                                                                    
           )
-          return global_kv                                                                                                                                                     
-                  
+          dist.all_gather_into_tensor(
+              global_kv, local_kv.contiguous(), group=group
+          )
+          return global_kv
+
       @staticmethod
       def backward(
           ctx,
           grad_global: torch.Tensor,  # [B, seq_len//128, 512]
-      ) -> tuple:                                                                                                                                                              
+      ) -> tuple:
           B, global_len, D = grad_global.shape
-          local_len = global_len // ctx.cp_size                                                                                                                                
-                  
-          grad_local = torch.empty(                                                                                                                                            
+          local_len = global_len // ctx.cp_size
+
+          grad_local = torch.empty(
               B, local_len, D,
-              dtype=grad_global.dtype,                                                                                                                                         
+              dtype=grad_global.dtype,
               device=grad_global.device,
-          )                                                                                                                                                                    
+          )
           dist.reduce_scatter_tensor(
               grad_local, grad_global.contiguous(), group=ctx.group
           )
-          return grad_local, None  # group 无梯度                                                                                                                              
-   
-                                                                                                                                                                               
-  def allgather_kv_compress(
-      local_kv: torch.Tensor,                                                                                                                                                  
+          return grad_local, None  # group 无梯度
+          
+def allgather_kv_compress(
+      local_kv: torch.Tensor,
       group: dist.ProcessGroup,
   ) -> torch.Tensor:
       return AllGatherCompressedKV.apply(local_kv, group)
 ```
-                                                                                                                                                                               
-  4.3 C128A 前向主逻辑
-                                                                                                                                                                               
-  def c128a_forward_with_cp(
-      x: torch.Tensor,              # [B, chunk, D]                                                                                                                            
-      compressor,                   # ratio=128 Compressor 实例
-      window_proj,                  # Window KV 投影                                                                                                                           
-      attention,                    # 标准 MultiheadAttention                                                                                                                  
-      cp_rank: int,                                                                                                                                                            
-      cp_size: int,                                                                                                                                                            
-      cp_group: dist.ProcessGroup,                                                                                                                                             
-      seq_len: int,                                                                                                                                                            
-      window_size: int = 128,
-  ) -> torch.Tensor:                                                                                                                                                           
-                                                                                                                                                                               
-      B, chunk, D = x.shape
-      ratio = 128                                                                                                                                                              
-                  
-      # ── 0. 校验（仅在首次调用或 debug 模式下执行）──────────────────────────                                                                                                
-      # validate_c128a_cp_alignment(seq_len, cp_size)  # 建议在模型初始化时调用
-                                                                                                                                                                               
-      # ── 1. 本地 Window KV（纯本地，无通信）────────────────────────────────                                                                                                 
-      # 仅需本 rank 的 chunk，借助 ratio=1 层的 P2P 边界 token 处理                                                                                                            
-      local_window_kv = window_proj(x)   # [B, chunk, head_dim=512]                                                                                                            
-                                                                                                                                                                               
-      # ── 2. 本地压缩（compressor 在本地 chunk 上独立运行）────────────────────                                                                                               
-      # compressor 内部处理尾部丢弃：                                                                                                                                          
-      #   valid_len = (chunk // ratio) * ratio  （一般 chunk%128==0，无丢弃）                                                                                                  
-      #   x_valid   = x[:, :valid_len, :]                                                                                                                                      
-      #   压缩后输出: [B, chunk//ratio, head_dim]                                                                                                                              
-      local_kv_compress = compressor(x)  # [B, chunk//128, 512]                                                                                                                
-                                                                                                                                                                               
-      # ── 3. AllGather 压缩 KV（通信量 ~512KB，可忽略）───────────────────────                                                                                                
-      # 反向时自动执行 ReduceScatter                                                                                                                                           
-      global_kv_compress = allgather_kv_compress(                                                                                                                              
-          local_kv_compress, group=cp_group
-      )  # [B, seq_len//128, 512]                                                                                                                                              
-                                                                                                                                                                               
-      # ── 4. 因果有效性裁剪（AllGather 包含了未来 rank 的数据）──────────────                                                                                                 
-      # C128A 无 Lightning Indexer，做完整 attention，但仍需遵守因果约束：                                                                                                     
-      # rank r 的 query 最远只能看到全局位置 (r+1)*chunk - 1 对应的压缩 KV                                                                                                     
-      # 即最多看到前 (cp_rank+1)*chunk//128 个压缩 token                                                                                                                       
-      valid_compress_len = (cp_rank + 1) * (chunk // ratio)                                                                                                                    
-      causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]                                                                                                       
-      # [B, (cp_rank+1)*chunk//128, 512]                                                                                                                                       
-      # rank 0: [B, chunk//128, 512]                                                                                                                                           
-      # rank 7: [B, seq_len//128, 512]  （最后一个 rank 看到全部）                                                                                                             
-                                                                                                                                                                               
-      # ── 5. 拼接 Window KV 与压缩 KV ────────────────────────────────────────                                                                                                
-      # kv_states: [B, chunk + valid_compress_len, 512]                                                                                                                        
-      kv_states = torch.cat([local_window_kv, causal_kv_compress], dim=1)                                                                                                      
-                                                                                                                                                                               
-      # ── 6. 标准 Attention（无稀疏，无 Indexer）──────────────────────────────                                                                                               
-      # q:         [B, chunk, head_dim]                                                                                                                                        
-      # kv_states: [B, chunk + valid_compress_len, head_dim]                                                                                                                   
-      q = query_proj(x)
-      out = attention(q, kv_states)  # [B, chunk, D]                                                                                                                           
-                  
-      return out                                                                                                                                                               
-                  
-  4.4 Compressor 内部尾部丢弃（确认丢弃位置）                                                                                                                                  
    
-  class Compressor(nn.Module):                                                                                                                                                 
+  3.2.4.3 C128A 前向主逻辑
+```python
+  def c128a_forward_with_cp(
+      x: torch.Tensor,              # [B, chunk, D]
+      compressor,                   # ratio=128 Compressor 实例
+      window_proj,                  # Window KV 投影
+      attention,                    # 标准 MultiheadAttention
+      cp_rank: int,
+      cp_size: int,
+      cp_group: dist.ProcessGroup,
+      seq_len: int,
+      window_size: int = 128,
+  ) -> torch.Tensor:
+      B, chunk, D = x.shape
+      ratio = 128
+      
+      # ── 0. 校验（仅在首次调用或 debug 模式下执行）──────────────────────────  
+      # validate_c128a_cp_alignment(seq_len, cp_size)  # 建议在模型初始化时调用
+      
+      # ── 1. 本地 Window KV（纯本地，无通信）────────────────────────────────
+      # 仅需本 rank 的 chunk，借助 ratio=1 层的 P2P 边界 token 处理
+      local_window_kv = window_proj(x)   # [B, chunk, head_dim=512]
+      
+      # ── 2. 本地压缩（compressor 在本地 chunk 上独立运行)────────────────────
+      # compressor 内部处理尾部丢弃
+      #   valid_len = (chunk // ratio) * ratio  （一般 chunk%128==0，无丢弃）
+      #   x_valid   = x[:, :valid_len, :]
+      #   压缩后输出: [B, chunk//ratio, head_dim]
+      local_kv_compress = compressor(x)  # [B, chunk//128, 512]
+      
+      # ── 3. AllGather 压缩 KV（通信量 ~512KB，可忽略)───────────────────────
+      # 反向时自动执行 ReduceScatter
+      global_kv_compress = allgather_kv_compress(
+          local_kv_compress, group=cp_group
+      )  # [B, seq_len//128, 512]
+      
+      # ── 4. 因果有效性裁剪（AllGather 包含了未来 rank 的数据）──────────────
+      # C128A 无 Lightning Indexer，做完整 attention，但仍需遵守因果约束:
+      # rank r 的 query 最远只能看到全局位置 (r+1)*chunk - 1 对应的压缩 KV
+      # 即最多看到前 (cp_rank+1)*chunk//128 个压缩 token
+      valid_compress_len = (cp_rank + 1) * (chunk // ratio)
+      causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]
+      # [B, (cp_rank+1)*chunk//128, 512]
+      # rank 0: [B, chunk//128, 512]
+      # rank 7: [B, seq_len//128, 512]  （最后一个 rank 看到全部）
+      
+      # ── 5. 拼接 Window KV 与压缩 KV─────────────────────────────────────
+      # kv_states: [B, chunk + valid_compress_len, 512]
+      kv_states = torch.cat([local_window_kv, causal_kv_compress], dim=1)
+      
+      # ── 6. 标准 Attention（无稀疏，无 Indexer)────────────────────────────
+      # q:         [B, chunk, head_dim]
+      # kv_states: [B, chunk + valid_compress_len, head_dim]
+      q = query_proj(x)
+      out = attention(q, kv_states)  # [B, chunk, D]
+      return out     
+```
+                  
+ 3.2.4.4 Compressor 内部尾部丢弃（确认丢弃位置）
+```python
+  class Compressor(nn.Module):
       def __init__(self, ratio: int = 128, ...):
-          self.ratio = ratio                                                                                                                                                   
-                                                                                                                                                                               
+          self.ratio = ratio
       def forward(self, x: torch.Tensor) -> torch.Tensor:
-          # x: [B, seq_len, D]                                                                                                                                                 
+          # x: [B, seq_len, D]
           B, S, D = x.shape
-                                                                                                                                                                               
-          # 尾部丢弃：在 compressor 内部处理，各 rank 独立截断本地 chunk 尾部                                                                                                  
-          valid_len = (S // self.ratio) * self.ratio                                                                                                                           
-          if valid_len < S:                                                                                                                                                    
+          
+          # 尾部丢弃：在 compressor 内部处理，各 rank 独立截断本地 chunk 尾部
+          valid_len = (S // self.ratio) * self.ratio
+          if valid_len < S:
               x = x[:, :valid_len, :]   # 丢弃末尾 S%ratio 个 token
-                                                                                                                                                                               
-          # reshape: [B, S//ratio, ratio, D] → 压缩 → [B, S//ratio, head_dim]                                                                                                  
-          x = x.reshape(B, S // self.ratio, self.ratio, D)                                                                                                                     
-          kv = self.compress_proj(x)     # 线性压缩                                                                                                                            
-          return kv                      # [B, S//ratio, head_dim]                                                                                                             
+              
+          # reshape: [B, S//ratio, ratio, D] → 压缩 → [B, S//ratio, head_dim]
+          x = x.reshape(B, S // self.ratio, self.ratio, D)
+          kv = self.compress_proj(x)     # 线性压缩
+          return kv                      # [B, S//ratio, head_dim]
+```
                           
 
   3.3 ratio=4：C4A（最复杂，需分步处理）
@@ -361,14 +359,14 @@ class AllGatherCompressedKV(torch.autograd.Function):
   ---
   六、实现建议
 
-  1. 在 Attention.forward() 注入 CP rank/size 信息，通过 CustomContextParallelContext patch 方式（参考现有 AscendDSAContextParallelContext）注入
+  4. 在 Attention.forward() 注入 CP rank/size 信息，通过 CustomContextParallelContext patch 方式（参考现有 AscendDSAContextParallelContext）注入
   cp_rank, cp_size, cp_mesh，不修改 model 本身签名。
 
-  2. 为 C4A 单独实现 mhc_c4a_forward_with_cp()，复用现有 allgather_sequence() 工具函数。
+  5. 为 C4A 单独实现 mhc_c4a_forward_with_cp()，复用现有 allgather_sequence() 工具函数。
 
-  3. 为 C128A 实现 mhc_c128a_forward_with_cp()，逻辑更简单（无 Indexer，直接 AllGather）。
+  6. 为 C128A 实现 mhc_c128a_forward_with_cp()，逻辑更简单（无 Indexer，直接 AllGather）。
 
-  4. LiCompute 需要接受 offset_seqlen（rank offset）参数，用于全局因果 mask 计算，这是与当前 V3.2 CP 实现的主要差异点。
+  7. LiCompute 需要接受 offset_seqlen（rank offset）参数，用于全局因果 mask 计算，这是与当前 V3.2 CP 实现的主要差异点。
 
 	  1. 反向梯度：AllGather 的反向自动对应 ReduceScatter（参考已有的 AllgatherOnSequence 或 DTensor Shard→Replicate 机制），无需额外处理。x
 
