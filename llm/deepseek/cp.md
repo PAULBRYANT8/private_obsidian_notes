@@ -273,14 +273,12 @@ def allgather_kv_compress(
 
   Step 1：Overlap 边界通信
 
-  Compressor 在 ratio=4 时 overlap=True，其 overlap_transform 让每个压缩 token 消费相邻两组原始 token（前后各 4 个）。因此 rank r 的第一个压缩 token
-   需要 rank r-1 最后 4 个原始 token：
+  Compressor 在 ratio=4 时 overlap=True，其 overlap_transform 让每个压缩 token 消费相邻两组原始 token（前后各 4 个）。因此 rank r 的第一个压缩 token需要 rank r-1 最后 4 个原始 token：
 
   # overlap_transform: model.py:127-133
   new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]  # 前一组 shift 进来
 
-  解法：P2P Recv 前 rank 最后 compress_ratio=4 个 token，prepend 后运行 Compressor，去除首个压缩 token（它用了借来的边界数据，不属于本 rank
-  的有效输出），剩余 chunk/4 个压缩 token 是有效的。
+  解法：P2P Recv 前 rank 最后 compress_ratio=4 个 token，prepend 后运行 Compressor，去除首个压缩 token（它用了借来的边界数据，不属于本 rank的有效输出），剩余 chunk/4 个压缩 token 是有效的。
 
   Step 2：AllGather k_indexer 和 kv_compress
 
