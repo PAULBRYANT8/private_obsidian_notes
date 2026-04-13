@@ -36,6 +36,31 @@ DeepSeek-2026 CP 切分设计方案
   - 通信原语：P2P Send/Recv（仅向前一个 rank 借 128 个 token）
   - 通信量：128 × head_dim × 2B = 128 × 512 × 2B ≈ 131KB（极小）
   - 无需修改 SparseAttention 逻辑，只需在 forward 前拼接边界 token
+- 采用 isend + irecv + wait() 的策略：
+```python
+  def window_boundary_comm(boundary_tokens, recv_buf, rank, cp_size, group):
+      """                                                                   
+      boundary_tokens: (B, 128, head_dim)，当前 rank 最后 128 个 token
+      recv_buf:        (B, 128, head_dim)，预分配接收缓冲区                    
+      """
+
+      reqs = []  
+
+      # 向右邻居发送（非阻塞，立即挂起）
+      if rank < cp_size - 1:
+          reqs.append(dist.isend(boundary_tokens, dst=rank + 1, group=group)) 
+          
+      # 从左邻居接收（非阻塞，立即挂起）
+      if rank > 0:
+          reqs.append(dist.irecv(recv_buf, src=rank - 1, group=group))    
+
+      # ← 这里可以插入本地计算（计算通信 overlap）                                                                                                           
+      # 统一等待所有挂起请求
+      for req in reqs:
+          req.wait()
+      return recv_buf if rank > 0 else None
+```
+采用这个策略不会造成死锁的原因：isend/irecv 只是向通信后端注册请求并立即返回，不阻塞。所有rank在 wait() 之前就已经同时把 send/recv 同时挂起了，后端在内和段完全比配。
 
   3.2 ratio=128：C128A（AllGather 压缩 KV，廉价）
 
