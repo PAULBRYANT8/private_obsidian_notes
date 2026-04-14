@@ -28,7 +28,30 @@ DeepSeek-2026 CP 切分设计方案
 
 ## 3.1 ratio=1：Window Attention（单向边界通信）
 
-Window Attention
+
+> [!NOTE] ratio=1 和 发送 1 个 token 的区别
+> ratio=1 表示没有压缩，每个 token 的 KV 就是它本身，不会被合并成更少的 token。
+> Window Attention 的计算需求：Window Attention 中，每个 query 可以向左看 window_size=128 个原始 token；query 在全局位置 i -> 需要 KV 的位置来自 [i - 127, i]；
+
+```
+  CP 切分后，rank r 的起始 query 位置是 r*chunk：
+  
+  rank r 的第 0 个 query（位置 r*chunk）：
+    需要 KV 来自 [r*chunk - 127,  r*chunk - 1]  ← 这 127 个在 rank r-1 上
+    
+  rank r 的第 1 个 query（位置 r*chunk + 1）：
+    需要 KV 来自 [r*chunk - 126,  r*chunk    ]  ← 126 个在 rank r-1 上 
+    
+  rank r 的第 k 个 query（位置 r*chunk + k）：
+    需要 KV 来自 rank r-1 的最后 (128-k) 个 toke
+    
+  rank r 的第 128 个 query（位置 r*chunk + 128）：
+    需要 KV 来自 [r*chunk + 1, r*chunk + 128] ← 全部在 rank r 上，不再依赖 rank r-1
+    
+  所以需要从 rank r-1 借的 token 数量最多是 128（前 128 个 query 都有不同程度的跨 rank 依赖），发送完整的 window_size=128 个 token 是最简洁的做法。
+```
+
+具体需要传送内容的演示：
 ```
   rank r-1: [..., token_{r*chunk - 128}, ..., token_{r*chunk - 1}]
 			                                     ↓  Send last window_size tokens to next the rank
@@ -765,3 +788,5 @@ kv_compressor 要参与真正的 attention 计算，需要保留完整表征。 
 
   ---                                                                                                    
   
+
+[^1]: 
