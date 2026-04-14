@@ -22,15 +22,18 @@ DeepSeek-2026 CP 切分设计方案
   seqlen=4096,  cp=32 →  chunk=128,  128/128=1   ✓
 
   这样所有层的压缩边界都与 CP 切分边界自然对齐，无碎片问题。
-
+  
   ---
-  三、三类层的 CP 通信设计
+# 三、三类不同层的 CP 通信设计
 
-  3.1 ratio=1：Window Attention（单向边界通信）
+## 3.1 ratio=1：Window Attention（单向边界通信）
 
+Window Attention
+```
   rank r-1: [..., token_{r*chunk - 128}, ..., token_{r*chunk - 1}]
-                                     ↓  Send last window_size tokens
-  rank r:   [token_{r*chunk}, ...]   ←  Recv (128 tokens)
+			                                     ↓  Send last window_size tokens to next the rank
+rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
+```
 
   - 通信原语：P2P Send/Recv（仅向前一个 rank 借 128 个 token）
   - 通信量：128 × head_dim × 2B = 128 × 512 × 2B ≈ 131KB（极小）
