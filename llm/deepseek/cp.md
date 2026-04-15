@@ -783,9 +783,8 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
       # [B, (cp_rank+1)*chunk//4, head_dim]
 
       # ── Sparse Attention ────────────────────────────────────────────────
-      # kv_states = [window_kv ∥ causal_kv_compress]
-      # compress_topk_idxs 索引从 offset=chunk_size 起，指向 causal_kv_compress 的位置
-      o = attn.sparse_attn(q, kv, attn.attn_sink, causal_kv_compress, compress_topk_idxs)
+      # kv_full 含边界（rank>0）或不含（rank 0），compress_topk_idxs 以 offset 为基准
+      o = attn.sparse_attn(q, kv_full, attn.attn_sink, causal_kv_compress, compress_topk_idxs)
       o_nope, o_rope = torch.split(o, [attn.head_dim - rd, rd], dim=-1)
       o_rope = apply_rotary_emb(o_rope, freqs_local, inverse=True)
       o = torch.cat([o_nope, o_rope], dim=-1)
