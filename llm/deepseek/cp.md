@@ -85,27 +85,31 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
           req.wait()
       return recv_buf if rank > 0 else None
 ```
-采用这个策略不会造成死锁的原因：isend/irecv 只是向通信后端注册请求并立即返回，不阻塞。所有rank在 wait() 之前就已经同时把 send/recv 同时挂起了，后端在内和段完全比配。
+采用这个策略不会造成死锁的原因：<mark style="background:#b1ffff">isend/irecv 只是向通信后端注册请求并立即返回，不阻塞</mark>。所有rank在 wait() 之前就已经同时把 send/recv 同时挂起了，后端在内和段完全比配。
 
-  3.2 C128A CP 切分完整设计方案    
-	3.2.1设计前提与约束 
-	
-  对齐约束（必要条件）                                                                                                                                                 
-	  chunk_size = seq_len / cp_size
+## 3.2 C128A CP 切分完整设计方案
+### 3.2.1 设计前提与约束
+
+  对齐约束（必要条件）
+	chunk_size = seq_len / cp_size
   有效压缩要求：chunk_size % 128 == 0
   等价于：      seq_len % (cp_size * 128) == 0                                                                                                            
-  验证：                                                                                                                                                                       
+  验证：                                                     
     seq_len=65536, cp=8  → chunk=8192,  8192%128=0  ✓ 
     seq_len=4096,  cp=4  → chunk=1024,  1024%128=0  ✓ 
     seq_len=4096,  cp=32 → chunk=128,   128%128=0   ✓    
     seq_len=4096,  cp=64 → chunk=64,    64%128=64   ✗ → NotImplementedError
   常见训练序列（4096 的整数倍）在常用 CP degree（≤32）下均自然满足，约束实际不会触发。
+
+  约束 S % (CP * 128) == 0，不满足直接 raise
   
-  尾部 token 丢弃规则 
+  尾部 token 丢弃规则 （<mark style="background:#b1ffff">理论上应该用不上，我们这里对 seq_len 的大小有明确的约束</mark>）
   seq_len=65536 时，S % 128 = 0，无丢弃
   seq_len=65600 时（假设），65600 % 128 = 64，每 rank 丢弃本地 chunk 末尾 64 个 token                                                                                          
-  丢弃必须发生在 compressor 内部，由各 rank 独立处理本地尾部                                                                                                                             
-	  3.2.2数据流设计
+  如果要丢弃必须发生在 compressor 内部，由各 rank 独立处理本地尾部。
+
+### 3.2.2 数据流设计
+
   输入 x: [B, chunk, D]，chunk = seq_len / cp_size
   每个 CP rank 独立执行：
   ┌────────────────────────────────-┐   
@@ -115,7 +119,7 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
   │       │    → local_window_kv: [B,chunk,512]                     │ ← 纯本地，无通信
   │       │                                                                                            │ 
   │       └─ Compressor (ratio=128)                                         │
-  │            → 截断尾部：x[:, :chunk//128*128]                     │
+  │            → 截断尾部：x[:, :chunk//128*128]                     │ ← 本次设计中应该用不上
   │            → 压缩输出：[B, chunk//128, 512]                      │ ← 纯本地    
   └────────────────────────────────┘    
                 │   
@@ -136,7 +140,10 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
                 │     
                 ▼ 
           输出: [B, chunk, D]
-	  3.2.3通信量分析 
+
+### 3.2.3 通信量分析
+
+以 cp=8 为例：
   local_kv_compress 形状：[B, chunk//128, 512]
                          = [1, 8192//128, 512]  
                          = [1, 64, 512]
@@ -145,12 +152,13 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
   
   对比：                                                                                                                                                                       
     ratio=4  kv_compress AllGather：16 MB/layer
-    ratio=128 kv_compress AllGather：0.5 MB/layer  ← 便宜 32 倍  
-	
-	3.2.4伪代码实现
-  3.2.4.1 对齐校验
+    ratio=128 kv_compress AllGather：0.5 MB/layer  ← 缩小 32 倍  
+
+### 3.2.4 伪代码实现
+
+#### 3.2.4.1 对齐校验
 ```python
-  def validate_c128a_cp_alignment(seq_len: int, cp_size: int) -> None:
+def validate_c128a_cp_alignment(seq_len: int, cp_size: int) -> None:
       ratio = 128
       if seq_len % (cp_size * ratio) != 0:
           raise NotImplementedError(
@@ -160,8 +168,8 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
               f"Use seq_len that is a multiple of {cp_size * ratio}."
           )
 ```
-  
-  3.2.4.2 Autograd-aware AllGather（前向 AllGather，反向自动 ReduceScatter）                                                                                                         
+
+#### 3.2.4.2 Autograd-aware AllGather(前向 All-Gather，反向自动 Reduce-Scatter)
 ```python
 class AllGatherCompressedKV(torch.autograd.Function):
       """         
@@ -213,8 +221,8 @@ def allgather_kv_compress(
   ) -> torch.Tensor:
       return AllGatherCompressedKV.apply(local_kv, group)
 ```
-   
-  3.2.4.3 C128A 前向主逻辑
+
+#### 3.2.4.3 C281A 前向主逻辑
 ```python
   def c128a_forward_with_cp(
       x: torch.Tensor,              # [B, chunk, D]
@@ -271,35 +279,39 @@ def allgather_kv_compress(
       out = attention(q, kv_states)  # [B, chunk, D]
       return out     
 ```
-                  
- 3.2.4.4 Compressor 内部尾部丢弃（确认丢弃位置）
-```python
-  class Compressor(nn.Module):
-      def __init__(self, ratio: int = 128, ...):
-          self.ratio = ratio
-      def forward(self, x: torch.Tensor) -> torch.Tensor:
-          # x: [B, seq_len, D]
-          B, S, D = x.shape
-          
-          # 尾部丢弃：在 compressor 内部处理，各 rank 独立截断本地 chunk 尾部
-          valid_len = (S // self.ratio) * self.ratio
-          if valid_len < S:
-              x = x[:, :valid_len, :]   # 丢弃末尾 S%ratio 个 token
-              
-          # reshape: [B, S//ratio, ratio, D] → 压缩 → [B, S//ratio, head_dim]
-          x = x.reshape(B, S // self.ratio, self.ratio, D)
-          kv = self.compress_proj(x)     # 线性压缩
-          return kv                      # [B, S//ratio, head_dim]
-```
 
 
 ## 3.3 ratio=4：C4A（最复杂，需分步处理）
 
-3.2.4.4 C4A compressor 方案
- 一、问题定位                                                                                                                                                                 
-   
+### 3.3.1 C4A 需要分成 Compressor 和 Indexer 的原因
+
+```
+compressor：将原始 kv 压缩；
+	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
+			  k_indexer  [S/4, 128]  ->  检索用的轻量 kv
+
+indexer：在压缩 KV 中找出最相关的 top-k；
+	q    [chunk, head_dim]
+		│
+	k_indexer [S/4, 128]  <-  轻量 key
+		│
+	计算相关性分数（无 softmax，轻量）
+		│
+	top-k 位置索引
+		│
+	用索引从  kv_compressor 中取出 top-k 行
+		│
+	只对这 k 个位置做 attention
+```
+<mark style="background:#affad1">k_indexer  只用来做“相关性排序”，不需要携带完整语义信息</mark>。维度低 -> 检索更快 -> top-k 计算的代价小
+<mark style="background:#affad1">kv_compressor 要参与真正的 attention 计算，需要保留完整表征</mark>。 维度高 -> 保留语义 -> attention 质量高
+
+### 3.3.2 C4A Compressor 方案
+#### 3.3.2.1问题定位
+
   C4A compressor 使用 overlap=True，其 overlap_transform 使第 i 个压缩 token 依赖第 i-1 个 group 的数据：
-  new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]  # group i 混入 group i-1 的数据
+	  new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]    # group i 混入 group i-1 的数据
+
   CP 切分后，rank r 的 compressed_token[0] 需要 rank r-1 最后一个 group 的数据，但本地看不到，导致错误地填入全 0：
   非 CP（正确）：  compressed[0 of rank r] = f(group_k,  group_{k-1})  ✓
   CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
