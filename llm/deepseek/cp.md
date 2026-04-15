@@ -340,20 +340,34 @@ def get_c128a_compress_topk_idxs_cp(
 	
 	# causal_mask[i][j] = True 表示 query i 不能看到压缩位置 j（未来）
 	causal_mask = compress_pos.unsqueeze(0) >= (global_base // ratio).unsqueeze(1)
-	
 	# [chunk, causal_kv_len]
+	
 	compress_topk = torch.where(causal_mask, -1, compress_pos + offset)
 	# [chunk, causal_kv_len]
-
-return compress_topk.unsqueeze(0).expand(bsz, -1, -1)
+	
+	return compress_topk.unsqueeze(0).expand(bsz, -1, -1)
 ```
 
+示例验证（seqlen=4096, cp=8, chunk=512, ratio=128）：
+```
+rank 0：causal_kv_len = 1*512//128 = 4
+query i=0 全局位置 1 → compress_pos < 1//128=0 → 无可用压缩 token（全 -1）
+query i=127 全局位置 128 → compress_pos < 128//128=1 → 可用 [0]
+query i=511 全局位置 512 → compress_pos < 512//128=4 → 可用 [0,1,2,3]
+
+rank 7：causal_kv_len = 8*512//128 = 32
+query i=0 全局位置 3585 → compress_pos < 3585//128=28 → 可用 [0..27]
+query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]（全量）
+```
+
+#### 3.2.5.4 C128A 前向主逻辑
 ```python
   def c128a_forward_with_cp(
       x: torch.Tensor,              # [B, chunk, D]
       compressor,                   # ratio=128 Compressor 实例
       window_proj,                  # Window KV 投影
-      attention,                    # 标准 MultiheadAttention
+      attn_sink,
+      sparse_attn,                  # SparseAttention 实例（ratio=128）
       cp_rank: int,
       cp_size: int,
       cp_group: dist.ProcessGroup,
@@ -366,45 +380,54 @@ return compress_topk.unsqueeze(0).expand(bsz, -1, -1)
       # ── 0. 校验（仅在首次调用或 debug 模式下执行）──────────────────────────  
       # validate_c128a_cp_alignment(seq_len, cp_size)  # 建议在模型初始化时调用
       
-      # ── 1. 本地 Window KV（纯本地，无通信）────────────────────────────────
-      # 仅需本 rank 的 chunk，借助 ratio=1 层的 P2P 边界 token 处理
-      local_window_kv = window_proj(x)   # [B, chunk, head_dim=512]
+      # ── 1. 本地 Window KV（纯本地投影）────────────────────────────────────
+      local_window_kv = window_proj(x) # [B, chunk, head_dim=512]
       
-      # ── 2. 本地压缩（compressor 在本地 chunk 上独立运行)────────────────────
-      # compressor 内部处理尾部丢弃
-      #   valid_len = (chunk // ratio) * ratio  （一般 chunk%128==0，无丢弃）
-      #   x_valid   = x[:, :valid_len, :]
-      #   压缩后输出: [B, chunk//ratio, head_dim]
-      local_kv_compress = compressor(x)  # [B, chunk//128, 512]
-      
-      # ── 3. AllGather 压缩 KV（通信量 ~512KB，可忽略)───────────────────────
-      # 反向时自动执行 ReduceScatter
-      global_kv_compress = allgather_kv_compress(
-          local_kv_compress, group=cp_group
-      )  # [B, seq_len//128, 512]
-      
-      # ── 4. 因果有效性裁剪（AllGather 包含了未来 rank 的数据）──────────────
-      # C128A 无 Lightning Indexer，做完整 attention，但仍需遵守因果约束:
-      # rank r 的 query 最远只能看到全局位置 (r+1)*chunk - 1 对应的压缩 KV
-      # 即最多看到前 (cp_rank+1)*chunk//128 个压缩 token
-      valid_compress_len = (cp_rank + 1) * (chunk // ratio)
-      causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]
-      # [B, (cp_rank+1)*chunk//128, 512]
-      # rank 0: [B, chunk//128, 512]
-      # rank 7: [B, seq_len//128, 512]  （最后一个 rank 看到全部）
-      
-      # ── 5. 拼接 Window KV 与压缩 KV─────────────────────────────────────
-      # kv_states: [B, chunk + valid_compress_len, 512]
-      kv_states = torch.cat([local_window_kv, causal_kv_compress], dim=1)
-      
-      # ── 6. 标准 Attention（无稀疏，无 Indexer)────────────────────────────
-      # q:         [B, chunk, head_dim]
-      # kv_states: [B, chunk + valid_compress_len, head_dim]
-      q = query_proj(x)
-      out = attention(q, kv_states)  # [B, chunk, D]
-      return out     
+      # ── 2. Window KV 边界通信（复用 3.1 节 window_boundary_comm）──────────
+      recv_buf = torch.zeros_like(local_window_kv[:, :window_size, :])
+      boundary_kv = window_boundary_comm(
+	      local_window_kv[:, -window_size:, :], recv_buf, cp_rank, cp_size, cp_group
+	  ) # rank > 0 时为 [B, 128, head_dim]，rank 0 返回 None
+	  
+	  if cp_rank > 0:
+		  kv_full = torch.cat([boundary_kv, local_window_kv], dim=1) # [B, 128+chunk, D]
+	  else:
+	      kv_full = local_window_kv # [B, chunk, D]
+	      
+	  # ── 3. Window topk 索引（CP 修正）────────────────────────────────────
+	  window_topk = cp_window_topk_idxs(B, chunk, window_size, cp_rank)
+	  # [B, chunk, 128]
+	  
+	  # ── 4. 本地压缩（compressor 在本地 chunk 上独立运行)────────────────────
+	  local_kv_compress = compressor(x) # [B, chunk//128, head_dim]
+	  
+	  # ── 5. AllGather 压缩 KV（通信量 ~512KB，可忽略)───────────────────────
+	  global_kv_compress = allgather_kv_compress(local_kv_compress, group=cp_group)
+	  # [B, seq_len//128, head_dim]
+	  
+	  # ── 6. 因果有效性裁剪──────────────────────────────────────────────────
+	  valid_compress_len = (cp_rank + 1) * (chunk // ratio)
+	  causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]
+	  # rank 0: [B, chunk//128, D]；rank 7: [B, seq_len//128, D]
+	  
+	  # ── 7. compress_topk_idxs（全局坐标修正）──────────────────────────────
+	  offset = kv_full.size(1) # rank 0: chunk；rank r>0: 128+chunk
+	  compress_topk = get_c128a_compress_topk_idxs_cp(
+		  B, chunk, ratio, cp_rank, valid_compress_len, offset
+	  )
+	  # [B, chunk, valid_compress_len]
+	  
+	  # ── 8. 合并 topk 索引并调用 SparseAttention ─────────────────────────
+	  q = query_proj(x) # [B, chunk, n_heads, head_dim]
+	  topk_idxs = torch.cat([window_topk, compress_topk], dim=-1).int()
+	  o = sparse_attn(q, kv_full, attn_sink, causal_kv_compress, compress_topk)
+	  # sparse_attn 内部会拼接 kv_full 和 causal_kv_compress
+	  
+	  return o     
 ```
+  
 
+---
 
 ## 3.3 ratio=4：C4A（最复杂，需分步处理）
 
@@ -432,7 +455,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 <mark style="background:#affad1">kv_compressor 要参与真正的 attention 计算，需要保留完整表征</mark>。 维度高 -> 保留语义 -> attention 质量高
 
 ### 3.3.2 C4A CP 方案设计
-#### 3.3.2.1问题定位
+#### 3.3.2.1 问题定位
 
   C4A compressor 使用 overlap=True，其 overlap_transform 使第 i 个压缩 token 依赖第 i-1 个 group 的数据：
 	  new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]    # group i 混入 group i-1 的数据
@@ -451,32 +474,65 @@ indexer：在压缩 KV 中找出最相关的 top-k；
           )
 ```
 
-#### 3.3.2.3 通用 BoundaryExchange （复用）
-```python
-  class BoundaryExchange(torch.autograd.Function):
-      @staticmethod
-      def forward(ctx, send_tensor, rank, cp_size, group):
-          ctx.rank, ctx.cp_size, ctx.group = rank, cp_size, group
-          recv_buf = torch.zeros_like(send_tensor)
-          reqs = []
-          if rank < cp_size - 1:
-              reqs.append(dist.isend(send_tensor.contiguous(), dst=rank+1, group=group))
-          if rank > 0:
-              reqs.append(dist.irecv(recv_buf, src=rank-1, group=group))
-          for req in reqs: req.wait()
-          return recv_buf
+#### 3.3.2.3 通用 BoundaryExchange （Compressor 跨 rank 边界修正）
 
-      @staticmethod
-      def backward(ctx, grad_recv):
-          grad_send = torch.zeros_like(grad_recv)
-          reqs = []
-          if ctx.rank > 0:
-              reqs.append(dist.isend(grad_recv.contiguous(), dst=ctx.rank-1, group=ctx.group))
-          if ctx.rank < ctx.cp_size - 1:
-              reqs.append(dist.irecv(grad_send, src=ctx.rank+1, group=ctx.group))
-          for req in reqs: req.wait()
-          return grad_send, None, None, None
+> [!IMPORTANT] rank 0 的 score 初始化必须用 `-inf`，不能用 `0`
+> 原 `overlap_transform` 对 score 使用 `value=float("-inf")` 初始化，
+> 使得 rank 0 位置 0 的 overlap 槽权重经 softmax 后接近 0（正确行为）。
+> 若 `recv_score` 在 rank 0 时为全 0，softmax 后 overlap 槽会得到非零权重，
+> 与非 CP 行为不一致，产生训练偏差。
+>
+> 修复：kv 和 score 分两次 BoundaryExchange，各自使用正确的初始值。
+
+```python
+class BoundaryExchange(torch.autograd.Function):
+	@staticmethod
+	def forward(ctx, send_tensor, rank, cp_size, group, init_value=0.0):
+		ctx.rank, ctx.cp_size, ctx.group = rank, cp_size, group
+		# init_value 控制 rank 0 收到的默认值
+		# kv: init_value=0.0 （与非 CP overlap_transform value=0 一致）
+		# score: init_value=-inf （与非 CP overlap_transform value=-inf 一致）
+		if init_value == 0.0:
+			recv_buf = torch.zeros_like(send_tensor)
+		else:
+			recv_buf = torch.full_like(send_tensor, init_value)
+		
+		reqs = []
+		
+		if rank < cp_size - 1:
+			reqs.append(dist.isend(send_tensor.contiguous(), dst=rank+1, group=group))
+		if rank > 0:
+			reqs.append(dist.irecv(recv_buf, src=rank-1, group=group))
+		for req in reqs: req.wait()
+		return recv_buf
+		
+	@staticmethod
+	def backward(ctx, grad_recv):
+		grad_send = torch.zeros_like(grad_recv)
+		reqs = []
+		if ctx.rank > 0:
+			reqs.append(dist.isend(grad_recv.contiguous(), dst=ctx.rank-1, group=ctx.group))
+		if ctx.rank < ctx.cp_size - 1:
+			reqs.append(dist.irecv(grad_send, src=ctx.rank+1, group=ctx.group))
+			
+		for req in reqs: req.wait()
+		return grad_send, None, None, None, None # 新增 init_value 的 None 梯度
 ```
+
+调用时分别传入正确的 init_value：
+```python
+# kv 边界交换：rank 0 接收全 0（与非 CP 一致）
+recv_kv_slice = BoundaryExchange.apply(kv_last, cp_rank, cp_size, cp_group, 0.0)
+
+# score 边界交换：rank 0 接收全 -inf（与非 CP 一致，避免 softmax 权重错误）
+recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group, float("-inf"))
+```
+  
+
+> **勘误**：原方案将 kv 和 score 拼在一起做单次 BoundaryExchange，recv_buf 统一初始化为
+> `zeros_like`。这导致 rank 0 的 recv_score 为 0 而非 -inf，使 `new_score[:, 0, :ratio]`
+> 被错误赋为 0，softmax 后 overlap 槽产生非零权重，与非 CP rank 0 行为不一致。
+> 改为分两次交换，各自使用正确的初始化值。
 
 #### 3.3.2.4 带 cp 边界修正的 compressor 前向
 ```python
@@ -496,7 +552,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       kv    = compressor.wkv(x_f)    # [B, chunk, 2*head_dim]
       score = compressor.wgate(x_f)  # [B, chunk, 2*head_dim]
 
-      # ── Step 2：截断尾部（chunk%ratio==0 时无截断，这一步还需要吗？前面不是有对齐了吗？对不齐不就直接报错了）───────────────────────
+      # ── Step 2：截断尾部（chunk%ratio==0 时无截断）────────────────────────
       cutoff = (chunk // ratio) * ratio
       if cutoff < chunk:
           kv    = kv[:, :cutoff]
@@ -506,17 +562,15 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       kv_g    = kv.unflatten(1, (-1, ratio))  # [B, chunk//4, 4, 2*d]
       score_g = score.unflatten(1, (-1, ratio)) + compressor.ape  # [B, chunk//4, 4, 2*d]
 
-      # ── Step 4：P2P 边界交换（kv + score 拼在一起，一次通信）────────────
-      # 发送：本 rank 末尾 group 的前 d 维（将被 shift 给下一 rank 的位置 0）
-      kv_last    = kv_g[:, -1:, :, :d]     # [B, 1, 4, d]
-      score_last = score_g[:, -1:, :, :d]  # [B, 1, 4, d]
-      send_slice = torch.cat([kv_last, score_last], dim=-1).contiguous()  # [B, 1, 4, 2*d]
-
-      recv_slice = BoundaryExchange.apply(send_slice, cp_rank, cp_size, cp_group)
-      # recv_slice: [B, 1, 4, 2*d]，rank 0 为全 0（kv 部分）和全 0（score 部分）
-
-      recv_kv    = recv_slice[:, :, :, :d]   # [B, 1, 4, d]
-      recv_score = recv_slice[:, :, :, d:]   # [B, 1, 4, d]
+      # ── Step 4：P2P 边界交换（kv 和 score 分两次，初始化值不同）──────────
+      kv_last = kv_g[:, -1:, :, :d].contiguous() # [B, 1, 4, d]
+      score_last = score_g[:, -1:, :, :d].contiguous() # [B, 1, 4, d]
+      
+      # kv: rank 0 接收全 0（与非 CP overlap_transform value=0 一致）
+      recv_kv = BoundaryExchange.apply(kv_last, cp_rank, cp_size, cp_group, 0.0)
+      # score: rank 0 接收全 -inf（与非 CP overlap_transform value=-inf 一致）
+      recv_score = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group, float("-inf"))
+      # recv_kv/recv_score: [B, 1, 4, d]
 
       # ── Step 5：手动执行 overlap_transform（带 CP 边界修正）────────────────
       s = chunk // ratio
@@ -532,17 +586,14 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       new_score[:, 1:, :ratio] = score_g[:, :-1, :, :d]
 
       # CP 边界修正（位置 0）
-      new_kv[:, 0, :ratio]    = recv_kv[:, 0]    # rank 0 为全 0 ✓
-      new_score[:, 0, :ratio] = recv_score[:, 0]  # rank 0 为全 0（softmax 后趋近均匀，
-                                                  # 行为与非 CP rank 0 一致）
+      new_kv[:, 0, :ratio] = recv_kv[:, 0] # rank 0 为全 0 ✓（与非 CP 一致）
+      new_score[:, 0, :ratio] = recv_score[:, 0] # rank 0 为全 -inf ✓（与非 CP 一致）
 
       # ── Step 6：压缩 ─────────────────────────────────────────────────────
       out = (new_kv * new_score.softmax(dim=2)).sum(dim=2)  # [B, chunk//4, d]
       out = compressor.norm(out.to(dtype))
 
       # ── Step 7：RoPE（使用全局位置） ─────────────────────────────────────
-      # 非 CP：freqs_cis[:cutoff:ratio]（局部 0~chunk 位置）
-      # CP：  freqs_cis[cp_rank*chunk : (cp_rank+1)*chunk : ratio]（全局位置）
       global_start = cp_rank * chunk_size
       freqs_compress = freqs_cis_global[global_start : global_start + cutoff : ratio]
       kv_rot = apply_rotary_emb(out[..., -compressor.rope_head_dim:], freqs_compress)
@@ -642,7 +693,15 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       return compress_topk_idxs, index_score
 ```
 
-#### 3.3.2.8 完整的 c4a attention 前向
+#### 3.3.2.8 完整的 c4a attention 前向（含窗口 KV 边界通信）
+> [!IMPORTANT] C4A 的 Window KV 也需要边界通信
+> C4A 层的 `SparseAttention` 同样调用 `GetWindowTopkIdxs`（`model.py:518`），
+> 存在与 ratio=1 层完全相同的跨 rank 窗口依赖问题。
+> 原方案仅处理了 Compressor 的跨 rank 边界，遗漏了 Window KV 的边界通信。
+>
+> 修复：在 Window KV 投影后，执行与 3.1 节相同的 P2P 通信 + window_topk_idxs 修正。
+
+
 ```python
   def c4a_attention_forward_with_cp(
       attn,               # Attention 实例（compress_ratio=4）
@@ -652,6 +711,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       cp_rank, cp_size, cp_group,
       chunk_size, seq_len,
       ratio=4,
+      window_size =128,
   ):
       B, chunk, D = x.shape
       rd = attn.rope_head_dim
@@ -666,13 +726,28 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       q_rope = apply_rotary_emb(q_rope, freqs_local)
       q = torch.cat([q_nope, q_rope], dim=-1)   # [B, chunk, n_heads, head_dim]
 
-      # ── Window KV（纯本地）─────────────────────────────────────────────
+      # ── Window KV 投影（纯本地）───────────────────────────────────────────
       kv = attn.kv_norm(attn.wkv(x))
       kv_nope, kv_rope = torch.split(kv, [attn.head_dim - rd, rd], dim=-1)
       kv_rope = apply_rotary_emb(kv_rope, freqs_local)
       kv = torch.cat([kv_nope, kv_rope], dim=-1)   # [B, chunk, head_dim]
 
-      offset = kv.size(1)   # = chunk_size，window KV 占据 [0, chunk_size)
+      # ── Window KV 边界通信（与 ratio=1 层相同，复用 3.1 节）──────────────
+      recv_buf = torch.zeros_like(kv[:, :window_size, :])
+      boundary_kv = window_boundary_comm(
+          kv[:, -window_size:, :], recv_buf, cp_rank, cp_size, cp_group
+	  ) # rank > 0: [B, 128, head_dim]；rank 0: None
+	  
+	  if cp_rank > 0:
+		  kv_full = torch.cat([boundary_kv, kv], dim=1) # [B, 128+chunk, head_dim]
+	  else:
+		  kv_full = kv # [B, chunk, head_dim]
+	  # ── Window topk 索引（CP 修正，复用 3.1 节）────────────────────────
+	  window_topk = cp_window_topk_idxs(B, chunk, window_size, cp_rank)
+	  # [B, chunk, 128]
+	  
+	  # offset 需要从 kv_full 实际长度算起
+	  offset = kv_full.size(1) # rank 0: chunk；rank r>0: 128+chunk
 
       # ── Indexer（x.detach，不传梯度）───────────────────────────────────
       with torch.no_grad():
@@ -685,12 +760,12 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       global_k_indexer = AllGatherCompressedKV.apply(k_indexer_local, cp_group)
       # [B, seq_len//4, index_head_dim]
 
-      # ── LiCompute：top-k 选择 ───────────────────────────────────────────
+      # ── LiCompute：top-k 选择 （使用全局坐标 offset）──────────────────────
       compress_topk_idxs, index_score = li_compute_with_cp(
           attn.li_compute, q_indexer, global_k_indexer, weights,
           chunk_size, seq_len, cp_rank, ratio, offset,
       )
-      # compress_topk_idxs: [B, chunk, topk]，索引从 offset 起
+      # compress_topk_idxs: [B, chunk, topk]，索引从 offset=kv_full.size(1) 起
 
       # ── 主 Compressor（kv_compress，overlap=True，需 BoundaryExchange）─
       local_kv_compress = compressor_forward_with_cp(
