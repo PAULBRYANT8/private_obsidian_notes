@@ -306,17 +306,17 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 <mark style="background:#affad1">k_indexer  只用来做“相关性排序”，不需要携带完整语义信息</mark>。维度低 -> 检索更快 -> top-k 计算的代价小
 <mark style="background:#affad1">kv_compressor 要参与真正的 attention 计算，需要保留完整表征</mark>。 维度高 -> 保留语义 -> attention 质量高
 
-### 3.3.2 C4A Compressor 方案
+### 3.3.2 C4A CP 方案设计
 #### 3.3.2.1问题定位
 
   C4A compressor 使用 overlap=True，其 overlap_transform 使第 i 个压缩 token 依赖第 i-1 个 group 的数据：
 	  new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]    # group i 混入 group i-1 的数据
 
   CP 切分后，rank r 的 compressed_token[0] 需要 rank r-1 最后一个 group 的数据，但本地看不到，导致错误地填入全 0：
-  非 CP（正确）：  compressed[0 of rank r] = f(group_k,  group_{k-1})  ✓
-  CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
+	  非 CP（正确）：  compressed[0 of rank r] = f(group_k,  group_{k-1})  ✓
+	  CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
 
-二、对齐约束
+#### 3.3.2.2 对齐约束（这里应该可以省略，直接在C128A Compressor 中对齐就可以了）
 ```python
   def validate_c4a_cp_alignment(seq_len: int, cp_size: int) -> None:
       if seq_len % (cp_size * 4) != 0:
@@ -326,7 +326,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
           )
 ```
 
-三、通用 BoundaryExchange （复用）
+#### 3.3.2.3 通用 BoundaryExchange （复用）
 ```python
   class BoundaryExchange(torch.autograd.Function):
       @staticmethod
@@ -353,8 +353,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
           return grad_send, None, None, None
 ```
 
-三、带 cp 边界修正的 compressor 前向
-
+#### 3.3.2.4 带 cp 边界修正的 compressor 前向
 ```python
  def compressor_forward_with_cp(
       compressor,          # Compressor 实例（overlap=True）
@@ -372,7 +371,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       kv    = compressor.wkv(x_f)    # [B, chunk, 2*head_dim]
       score = compressor.wgate(x_f)  # [B, chunk, 2*head_dim]
 
-      # ── Step 2：截断尾部（chunk%ratio==0 时无截断） ───────────────────────
+      # ── Step 2：截断尾部（chunk%ratio==0 时无截断，这一步还需要吗？前面不是有对齐了吗？对不齐不就直接报错了）───────────────────────
       cutoff = (chunk // ratio) * ratio
       if cutoff < chunk:
           kv    = kv[:, :cutoff]
@@ -427,7 +426,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       return out   # [B, chunk//4, head_dim]
 ```
 
-四、indexer 前向（两个 Compressor 相互独立 BoundaryExchange ）
+#### 3.3.2.5 Indexer 前向（两个 Compressor 相互独立 BoundaryExchange ）
 ```python
  def indexer_forward_with_cp(
       indexer,             # Indexer 实例
@@ -467,7 +466,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       # weights:   [B, chunk, n_heads]（本地）
 ```
 
-五、all-gather （复用 c128）
+#### 3.3.2.6 all-gather （复用 c128）
 ```python
   # 两路 AllGather，反向自动 ReduceScatter
   global_kv_compress = AllGatherCompressedKV.apply(local_kv_compress, cp_group)
@@ -477,8 +476,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
   # [B, seq_len//4, index_head_dim]
 ```
 
-六、LiCompute CP 修正
-
+#### 3.3.2.7 LiCompute CP 修正
 ```python
   def li_compute_with_cp(
       li_compute,          # LiCompute 实例
@@ -519,8 +517,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       return compress_topk_idxs, index_score
 ```
 
-七、完整的 c4a attention 前向
-
+#### 3.3.2.8 完整的 c4a attention 前向
 ```python
   def c4a_attention_forward_with_cp(
       attn,               # Attention 实例（compress_ratio=4）
@@ -604,201 +601,3 @@ indexer：在压缩 KV 中找出最相关的 top-k；
       return o, loss
 ```
 
-八、c4a 需要分成 compressor 和 indexer 的原因
-
-```
-compressor：将原始 kv 压缩；
-	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
-			  k_indexer  [S/4, 128]  ->  检索用的轻量 kv
-indexer：在压缩 KV 中找出最相关的 top-k；
-	q    [chunk, head_dim]
-		│
-	k_indexer [S/4, 128]  <-  轻量 key
-		│
-	计算相关性分数（无 softmax，轻量）
-		│
-	top-k 位置索引
-		│
-	用索引从  kv_compressor 中取出 top-k 行
-		│
-	只对这 k 个位置做 attention
-```
-k_indexer  只用来做“相关性排序”，不需要携带完整语义信息。维度低 -> 检索更快 -> top-k 计算的代价小
-kv_compressor 要参与真正的 attention 计算，需要保留完整表征。 维度高 -> 保留语义 -> attention 质量高
-
-3.2.4.5 c4a indexer
-数据流
-```
-输入 x: [B, chunk, D]
-          │
-          ├──────────────────────────────────────────────────────────────────┐
-          │  主 Compressor（overlap=True）                                    │ Indexer
-          │  kv_g, score_g = project + reshape                               │（overlap=True）
-          │  send = cat[kv_last, score_last]  ──isend──► rank+1              │ 同样逻辑
-          │  recv ◄──irecv── rank-1           （BoundaryExchange）            │ 独立 P2P
-          │  new_kv[0]    ← recv[:,:,:,:d]                                   │
-          │  new_score[0] ← recv[:,:,:,d:]                                   │
-          │  compress + norm + RoPE（全局位置）                               │
-          ▼                                                                   ▼
-  local_kv_compress [B, chunk//4, 512]            k_indexer_local [B, chunk//4, 128]
-          │                                                   │
-          │          AllGather（反向 ReduceScatter）           │
-          ▼                                                   ▼
-  global_kv_compress [B, seq//4, 512]         global_k_indexer [B, seq//4, 128]
-          │                                                   │
-          │                                    q_indexer [B, chunk, n_heads, 128]（本地）
-          │                                    weights   [B, chunk, n_heads]（本地）
-          │                                               │
-          │                                    LiCompute（CP 全局坐标修正）
-          │                                    → compress_topk_idxs [B, chunk, topk]
-          │
-          │ 因果裁剪 valid_len = (cp_rank+1)*chunk//4
-          ▼
-  causal_kv_compress [B, valid_len, 512]
-          │
-          ├── SparseAttention(q, window_kv ∥ causal_kv_compress, compress_topk_idxs)
-          │
-          └── LiLoss(q, causal_kv_compress, q_indexer, global_k_indexer, ...)
-```
-  ---
-  五、各模块 CP 属性汇总
-
-  模块                    CP 通信类型              通信量（seqlen=65536, cp=8）
-  ─────────────────────────────────────────────────────────────────────────
-  HC (HcPre/HcPost)       无（纯本地混合）          0
-  MoE（hash 层）          无（按 token_id 路由）     0
-  MoE（普通层）           无（token 独立）           0
-  ratio=1 Window KV       P2P（单向边界）            ~131 KB/layer
-  ratio=128 Compressor    AllGather                  ~512 KB/layer
-  ratio=4 k_indexer       AllGather                  ~4 MB/layer
-  ratio=4 kv_compress     AllGather                  ~16 MB/layer
-
-  ---
-  六、实现建议
-
-  4. 在 Attention.forward() 注入 CP rank/size 信息，通过 CustomContextParallelContext patch 方式（参考现有 AscendDSAContextParallelContext）注入
-  cp_rank, cp_size, cp_mesh，不修改 model 本身签名。
-
-  5. 为 C4A 单独实现 mhc_c4a_forward_with_cp()，复用现有 allgather_sequence() 工具函数。
-
-  6. 为 C128A 实现 mhc_c128a_forward_with_cp()，逻辑更简单（无 Indexer，直接 AllGather）。
-
-  7. LiCompute 需要接受 offset_seqlen（rank offset）参数，用于全局因果 mask 计算，这是与当前 V3.2 CP 实现的主要差异点。
-
-	  1. 反向梯度：AllGather 的反向自动对应 ReduceScatter（参考已有的 AllgatherOnSequence 或 DTensor Shard→Replicate 机制），无需额外处理。x
-
-
-
-
-
-
-二、C128A 的 CP 方案可行性分析
-
-  你的方案描述是：
-  1. Compressor 在各 rank 本地独立运行，输出 [B, S//128//CP, 512]
-  2. 稀疏注意力计算前，AllGather 压缩 KV → [B, S//128, 512]
-  3. 反向 ReduceScatter 梯度
-  4. 约束 S % (CP * 128) == 0，不满足直接 raise
-
-  整体方向完全可行，但有一个关键细节需要处理。
-
-  ---
-  2.1 Compressor 本地运行：✅ 完全正确
-
-  ratio=128 时 overlap=False（代码 model.py:114：self.overlap = compress_ratio == 4），压缩是纯局部操作：
-
-  # Compressor.forward() for ratio=128
-  kv = kv.unflatten(1, (-1, 128))          # [B, S//(128*CP), 128, head_dim]
-  score = score.unflatten(1, (-1, 128)) + self.ape
-  kv = (kv * score.softmax(dim=2)).sum(2)  # [B, S//(128*CP), head_dim]
-
-  每 128 个连续 token 压缩为 1 个，组内操作，无跨 rank 依赖。在 S % (CP*128) == 0 的保证下，每个 rank
-  恰好得到 S//(128*CP) 个压缩 token，无尾部截断问题。
-
-  ---
-  2.2 AllGather + ReduceScatter：✅ 可行
-
-  local_kv_compress  # [B, S//(128*CP), 512]
-  global_kv_compress = all_gather(local_kv_compress, dim=1)  # [B, S//128, 512]
-
-  反向时，global_kv_compress 的梯度经 ReduceScatter 切回到各 rank，与 AllGather/ReduceScatter 对 KV
-  矩阵的标准用法一致。
-
-  ---
-  2.3 关键细节：GetCompressTopkIdxs 的因果 mask 需要修正
-
-  这是方案中唯一需要额外处理的地方。看当前实现：
-
-  # model.py:435-438
-  def forward(self, ratio, bsz, seqlen, offset):
-      matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-      mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-      compress_topk = torch.where(mask, -1, matrix + offset)
-
-  非 CP 时，seqlen 就是全局序列长，因果 mask 自然正确。CP 下的问题：
-
-  - seqlen 变成了本地 chunk_size（例如 512）
-  - matrix 的范围是 [0, 512//128) = [0, 4)，只有 4 个本地压缩 token
-  - AllGather 之后 global_kv_compress 有 S//128 = 32 个 token（对于 seqlen=4096, cp=8）
-  - 但因果 mask 仍然只覆盖了 4 个 token 的范围，前序 rank 的压缩 token 全被遗漏了
-
-  修正方案：在 CP forward 中替换 GetCompressTopkIdxs 的调用，使 mask 用全局坐标：
-
-  # CP 模式下的修正逻辑
-  global_compress_len = global_seqlen // ratio          # S//128
-  cp_rank_offset = cp_rank * chunk_size                 # rank r 的全局 token 起点
-
-  # 本地 query i 的全局位置是 (cp_rank_offset + i)
-  # 因果：可访问 global compress token j 当且仅当 j < (cp_rank_offset + i + 1) // ratio
-  base_global = cp_rank_offset + torch.arange(chunk_size)  # 全局 query 坐标
-  matrix = torch.arange(global_compress_len)
-  mask = matrix.unsqueeze(0) >= (base_global.unsqueeze(1) + 1) // ratio
-  compress_topk = torch.where(mask, -1, matrix + offset)
-
-  注意两点：
-  - offset 依然是 kv.size(1) = chunk_size（window KV 占用了前 chunk_size 个槽位），不变
-  - 当 cp_rank > 0 时，前序 rank 的所有压缩 token（j < cp_rank * chunk_size // ratio）对本 rank 所有
-  query 都是可见的，这个修正自动处理了这一点
-
-  ---
-  2.4 S % (CP * 128) == 0 约束：✅ 合理
-
-  常见训练 seq_len（4096、8192、16384、32768、65536）全都是 4096 的倍数，而 128 整除 4096，因此只要 CP 是
-   2 的幂（训练中几乎总是如此），约束自动满足。在 CP 初始化时加一行校验即可：
-
-  if seq_len % (cp_degree * 128) != 0:
-      raise NotImplementedError(
-          f"For DeepSeek-2026 C128A CP, seq_len must be divisible by "
-          f"cp_degree * 128 = {cp_degree * 128}, got seq_len={seq_len}."
-      )
-
-  ---
-  三、方案总结
-
-  ┌───────────────────────┬────────────────────────────────────────────┬─────────────────────────────┐
-  │         步骤          │                    操作                    │        是否需要改动         │
-  ├───────────────────────┼────────────────────────────────────────────┼─────────────────────────────┤
-  │ Compressor 本地运行   │ 无跨 rank 依赖，直接本地执行               │ 无需改动                    │
-  ├───────────────────────┼────────────────────────────────────────────┼─────────────────────────────┤
-  │ AllGather kv_compress │ 标准 AllGather on dim=1                    │ 复用现有 allgather_sequence │
-  ├───────────────────────┼────────────────────────────────────────────┼─────────────────────────────┤
-  │ GetCompressTopkIdxs   │ 因果 mask 改用全局坐标                     │ 需修正（核心改动）          │
-  ├───────────────────────┼────────────────────────────────────────────┼─────────────────────────────┤
-  │ SparseAttention       │ kv_states = window_kv ∥ global_kv_compress │ 无需改动                    │
-  ├───────────────────────┼────────────────────────────────────────────┼─────────────────────────────┤
-  │ 反向 ReduceScatter    │ AllGather 的自动反向                       │ 无需改动                    │
-  ├───────────────────────┼────────────────────────────────────────────┼─────────────────────────────┤
-  │ 约束校验              │ S % (CP * 128) == 0                        │ 加一行 raise                │
-  └───────────────────────┴────────────────────────────────────────────┴─────────────────────────────┘
-
-  整体方案是可行且实现代价低的，主要工作量集中在 GetCompressTopkIdxs 的因果 mask
-  修正和约束校验，其余复用现有的 allgather/reduce-scatter 基础设施即可。
-
-
-
-
-
-  ---                                                                                                    
-  
-
-[^1]: 
