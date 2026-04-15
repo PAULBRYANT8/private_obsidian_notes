@@ -1,26 +1,25 @@
 #!/bin/bash
 
-# 进入笔记目录
-cd ~/obsidian保存内容/Notes
+# 1. 安全进入目录。加上 || exit 1，防止 cd 失败时在错误目录下执行 git add .
+cd ~/obsidian保存内容/Notes || { echo "进入目录失败"; exit 1; }
 
-# 1. 尝试拉取远端更新，防止多设备冲突
-# 使用 --rebase 可以保持提交记录整洁
+# 2. 先处理本地变动：暂存并提交
+if [ -n "$(git status --porcelain)" ]; then
+    echo "检测到本地变动，正在打包提交..."
+    git add .
+    git commit -m "Auto-sync: $(date '+%Y-%m-%d %H:%M:%S')"
+else
+    echo "本地文件无变动。"
+fi
+
+# 3. 此时本地工作区绝对干净，执行拉取不会再报“未暂存”的错误
+echo "拉取远端更新并合并..."
 git pull origin main --rebase
 
-# 2. 检查是否有文件变动
-if [ -n "$(git status --porcelain)" ]; then
-    echo "检测到变动，准备同步..."
-    
-    # 添加所有变动
-    git add .
-    
-    # 提交变动，带上时间戳
-    git commit -m "Auto-sync: $(date '+%Y-%m-%d %H:%M:%S')"
-    
-    # 3. 推送到远端
-    git push origin main
-    
-    echo "同步完成！"
+# 4. 推送到远端仓库，并增加失败判断
+echo "推送到远端仓库..."
+if git push origin main; then
+    echo "============= 同步成功：$(date '+%Y-%m-%d %H:%M:%S') ============="
 else
-    echo "文件无变动，跳过同步。"
+    echo "============= 同步失败：请检查网络或 Git 冲突 ============="
 fi
