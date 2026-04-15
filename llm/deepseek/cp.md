@@ -1,5 +1,32 @@
 
 DeepSeek-2026 CP 切分设计方案
+# 零、前提代码修复
+
+`args.py` 中 `attn_type` 属性访问 bug
+
+`DeepSeek2026ModelArgs` 未定义 `attn_type` 属性，直接访问会触发 `AttributeError`。
+
+```python
+# model/args.py:65 — 当前错误写法
+if (
+	job_config.parallelism.context_parallel_degree > 1
+		and self.attn_type != "sdpa" # ← AttributeError！
+):
+```
+
+修复方式（与 `infra/parallelize.py:179` 保持一致）：
+```python
+# 修复后
+attn_type = getattr(self, "attn_type", "sdpa")
+if (
+	job_config.parallelism.context_parallel_degree > 1
+		and attn_type != "sdpa"
+):
+	raise NotImplementedError("CP support is only supported for SDPA.")
+```
+
+
+---
 # 一、问题本质分析
 
   compress_ratios 的模式是 (1, 1, 4, 128, 4, 128, ..., 4, 128, 4)，三类层对应三种不同的序列依赖范围：
@@ -26,7 +53,7 @@ DeepSeek-2026 CP 切分设计方案
   ---
 # 三、三类不同层的 CP 通信设计
 
-## 3.1 ratio=1：Window Attention（单向边界通信）
+## 3.1 ratio=1：Window Attention（P2P 边界通信）
 
 
 > [!NOTE] ratio=1 和 发送 1 个 token 的区别
@@ -43,7 +70,7 @@ DeepSeek-2026 CP 切分设计方案
     需要 KV 来自 [r*chunk - 126,  r*chunk    ]  ← 126 个在 rank r-1 上 
     
   rank r 的第 k 个 query（位置 r*chunk + k）：
-    需要 KV 来自 rank r-1 的最后 (128-k) 个 toke
+    需要 KV 来自 rank r-1 的最后 (128-k) 个 token
     
   rank r 的第 128 个 query（位置 r*chunk + 128）：
     需要 KV 来自 [r*chunk + 1, r*chunk + 128] ← 全部在 rank r 上，不再依赖 rank r-1
@@ -60,7 +87,6 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
 
   - 通信原语：P2P Send/Recv（仅向前一个 rank 借 128 个 token）
   - 通信量：128 × head_dim × 2B = 128 × 512 × 2B ≈ 131KB（极小）
-  - 无需修改 SparseAttention 逻辑，只需在 forward 前拼接边界 token
 - 采用 isend + irecv + wait() 的策略：
 ```python
   def window_boundary_comm(boundary_tokens, recv_buf, rank, cp_size, group):
@@ -85,7 +111,54 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
           req.wait()
       return recv_buf if rank > 0 else None
 ```
-采用这个策略不会造成死锁的原因：<mark style="background:#b1ffff">isend/irecv 只是向通信后端注册请求并立即返回，不阻塞</mark>。所有rank在 wait() 之前就已经同时把 send/recv 同时挂起了，后端在内和段完全比配。
+采用这个策略不会造成死锁的原因：<mark style="background:#b1ffff">isend/irecv 只是向通信后端注册请求并立即返回，不阻塞</mark>。所有rank在 wait() 之前就已经同时把 send/recv 同时挂起了，后端在内存段完全匹配。
+
+### 3.1.1 KV 拼接后 window_topk_idxs 必须修正
+
+> [!IMPORTANT] 不能沿用原 GetWindowTopkIdxs 生成的索引
+> 原 `GetWindowTopkIdxs` 生成的索引基于本地坐标 `0..chunk-1`，拼接边界 token 后
+> local_kv 整体偏移到了位置 128，原有索引无法访问边界 token，**必须重新计算**。
+
+**rank 0**（无前驱）：
+- `kv_full = local_kv`，形状 `[B, chunk, head_dim]`
+- `window_topk` = 原 `GetWindowTopkIdxs(window_size=128, bsz, chunk)` 结果（不变）
+
+**rank r > 0**（有边界 token）：
+- `kv_full = cat([boundary_kv, local_kv], dim=1)`，形状 `[B, 128+chunk, head_dim]`
+- `kv_full[0:128]` = rank r-1 的末尾 128 个全局 token（全局位置 [r*chunk-128, r*chunk-1]）
+- `kv_full[128+j]` = rank r 的本地 token j（全局位置 r * chunk + j）
+- 对 query i（全局位置 r*chunk+i），所需 KV 全局窗口 [r*chunk+i-127, r*chunk+i] 映射到 kv_full 后：
+	- 起点：kv_full[i+1]（对应全局 r*chunk-127+i）
+	- 终点：kv_full[i+128]（对应全局 r*chunk+i）
+	- 即 window_topk[i] = [i+1, i+2, ..., i+128]，恰好 128 个，无需 clamp
+
+```python
+def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
+	"""
+	为 CP 模式生成 window attention 的 topk 索引。
+	rank 0 无边界 token，沿用原逻辑；rank > 0 需要考虑前置的 128 个边界 token。
+	"""
+	if cp_rank == 0:
+	# kv_full = local_kv [B, chunk, D]，原逻辑不变
+		base = torch.arange(chunk).unsqueeze(1) # [chunk, 1]
+		window_topk = (base - window_size + 1).clamp(0) + torch.arange(window_size)
+		window_topk = torch.where(window_topk > base, -1, window_topk)
+	
+	else:
+	# kv_full = [boundary(128) || local_kv(chunk)] [B, 128+chunk, D]
+	# query i → kv_full 位置 [i+1, i+2, ..., i+128]
+		base = torch.arange(chunk).unsqueeze(1) # [chunk, 1]
+		window_topk = base + torch.arange(1, window_size + 1) # [chunk, 128]
+	# 合法性：i ∈ [0, chunk), 取值范围 [1, chunk+127] ⊆ [0, 128+chunk-1] ✓
+	
+	return window_topk.unsqueeze(0).expand(bsz, -1, -1)
+```
+
+拼接完 window_topk_idxs 后，compress 相关的索引 offset 也需随之调整：
+- rank 0：`offset = chunk`（与原来相同）
+- rank r > 0：`offset = 128 + chunk`（kv_full 多了 128 个边界 token）
+
+---
 
 ## 3.2 C128A CP 切分完整设计方案
 ### 3.2.1 设计前提与约束
@@ -130,18 +203,29 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
   global_kv_compress: [B, seq_len//128, 512]   
                 │      
                 ▼
-  ┌────────────────────────────────┐
-  │  kv_states = cat([local_window_kv,                               │
-  │                   global_kv_compress], dim=1)                        │
-  │                                                                                                  │
-  │  标准 Attention(q, kv_states)                                           │ ← 无稀疏，直接全量 attention
-  │  （无 Lightning Indexer）                                                 │
-  └────────────────────────────────┘
+  ┌────────────────────────────────────────┐
+  │ kv_full = window_kv (含 P2P 边界修正)                                                │
+  │ kv_states = cat([kv_full, causal_kv_compress], dim=1)                    │
+  │                                                                                                                          │
+  │  SparseAttention(q, kv_full, attn_sink, causal_kv_compress,         │
+  │                                  compress_topk_idxs)                                                 │
+  │ （compress_topk_idxs 需用全局坐标，见 3.2.4）                             │
+  └────────────────────────────────────────┘
                 │     
                 ▼ 
           输出: [B, chunk, D]
 
-### 3.2.3 通信量分析
+### 3.2.3 C128A 的 Window KV 边界通信
+
+C128A 层的 `SparseAttention` 同样调用 `GetWindowTopkIdxs`，因此与 ratio=1 层存在相同的边界依赖问题。
+
+处理方式与 3.1 节完全相同：
+- 用 `window_boundary_comm` 获取 boundary_kv（rank r-1 末尾 128 token）
+- 构造 `kv_full = cat([boundary_kv, local_window_kv], dim=1)`（rank > 0）
+- 用 `cp_window_topk_idxs` 替换 `GetWindowTopkIdxs` 生成 window_topk_idxs
+- 更新 `offset = kv_full.size(1)`（rank > 0 时为 128+chunk，rank 0 时为 chunk）
+
+### 3.2.4 通信量分析
 
 以 cp=8 为例：
   local_kv_compress 形状：[B, chunk//128, 512]
@@ -154,9 +238,9 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
     ratio=4  kv_compress AllGather：16 MB/layer
     ratio=128 kv_compress AllGather：0.5 MB/layer  ← 缩小 32 倍  
 
-### 3.2.4 伪代码实现
+### 3.2.5 伪代码实现
 
-#### 3.2.4.1 对齐校验
+#### 3.2.5.1 对齐校验
 ```python
 def validate_c128a_cp_alignment(seq_len: int, cp_size: int) -> None:
       ratio = 128
@@ -169,7 +253,7 @@ def validate_c128a_cp_alignment(seq_len: int, cp_size: int) -> None:
           )
 ```
 
-#### 3.2.4.2 Autograd-aware AllGather(前向 All-Gather，反向自动 Reduce-Scatter)
+#### 3.2.5.2 Autograd-aware AllGather(前向 All-Gather，反向自动 Reduce-Scatter)
 ```python
 class AllGatherCompressedKV(torch.autograd.Function):
       """         
@@ -222,7 +306,48 @@ def allgather_kv_compress(
       return AllGatherCompressedKV.apply(local_kv, group)
 ```
 
-#### 3.2.4.3 C281A 前向主逻辑
+#### 3.2.5.3 C128A 的 compress_topk_idxs 全局坐标修正
+
+> [!IMPORTANT] 不能沿用原 GetCompressTopkIdxs 生成的索引
+> 原 `GetCompressTopkIdxs` 以本地 `seqlen`（即 chunk）为上界生成索引，例如
+> chunk=512, ratio=128 → 索引范围 `[0, 3]`。
+> 但 CP 模式下 `causal_kv_compress` 对 rank r 有 `(r+1)*chunk//128` 个 token，
+> rank r>0 的 query 需要访问更早 rank 的压缩 KV，原有索引完全不够。
+> 必须用**全局 query 坐标**重新计算因果掩码。
+
+```python
+def get_c128a_compress_topk_idxs_cp(
+	bsz: int,
+	chunk: int,
+	ratio: int, # = 128
+	cp_rank: int,
+	causal_kv_len: int, # = (cp_rank + 1) * chunk // ratio
+	offset: int, # = kv_full.size(1)，window KV 占用的长度
+) -> torch.Tensor: # [B, chunk, causal_kv_len]
+	"""
+	为 C128A 在 CP 模式下生成 compress_topk_idxs。
+	query 在本地位置 i（全局位置 cp_rank*chunk+i）最多看到全局压缩位置
+	j < (cp_rank*chunk + i + 1) // ratio 的压缩 token。
+	
+	causal_kv_compress 已经被 AllGather 后裁剪到前 causal_kv_len 个，
+	所以这里只需相对于 causal_kv_compress 做因果掩码即可。
+	"""
+	# 全局 query 位置（以 1 为基，方便计算 ceil(pos/ratio)）
+	global_base = cp_rank * chunk + torch.arange(1, chunk + 1) # [chunk]
+	
+	# 压缩 token 全局坐标
+	compress_pos = torch.arange(causal_kv_len) # [causal_kv_len]
+	
+	# causal_mask[i][j] = True 表示 query i 不能看到压缩位置 j（未来）
+	causal_mask = compress_pos.unsqueeze(0) >= (global_base // ratio).unsqueeze(1)
+	
+	# [chunk, causal_kv_len]
+	compress_topk = torch.where(causal_mask, -1, compress_pos + offset)
+	# [chunk, causal_kv_len]
+
+return compress_topk.unsqueeze(0).expand(bsz, -1, -1)
+```
+
 ```python
   def c128a_forward_with_cp(
       x: torch.Tensor,              # [B, chunk, D]

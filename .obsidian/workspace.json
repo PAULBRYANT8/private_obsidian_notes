@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "执行命令/ubuntu/清理垃圾的命令.md",
+                "file": "llm/deepseek/cp.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "清理垃圾的命令"
+              "title": "cp"
             }
           }
         ],
@@ -197,8 +197,8 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
-    "llm/deepseek/cp.md",
     "执行命令/ubuntu/清理垃圾的命令.md",
+    "llm/deepseek/cp.md",
     "执行命令/ubuntu",
     "未命名",
     "执行命令",
