@@ -52,6 +52,8 @@ CP 切分的挑战主要来自 Attention，不同层的 compress_ratio 决定了
 > 维护 4 个并行 stream，这是 MHC（Multi-Head Hyper-Connections）而非单头 HC。
 
 MHC 是纯 **per-token** 的局部操作：HcPre / HcPost 的 Sinkhorn 路由只在同一 token 的 `hc_mult=4` 个 stream 之间做加权混合，**不涉及任何跨 token 的序列交互**。CP 将序列按 token 切分，同一 token 的 4 个 stream 始终在同一 rank 上，因此 MHC **不需要任何 CP 通信**。
+
+CP 按序列维度 S 切分，rank r 持有位置 `[r*chunk, (r+1)*chunk)`。对于这些位置，所有 MHC 运算（HcPre、HcSplitSinkhorn、HcPost，以及跨层的 comb 矩阵链）都完全在本 rank 内自洽完成，不需要从其他 rank 获取任何数据。 CP 面对的是跨 token 数据依赖问题，MHC 本身没有这个问题，所以对 CP 完全透明。
   
   ---
 # 二、前提：Chunk 对齐约束（chunk 就是每个 cp rank 持有的本地序列片段）
@@ -188,12 +190,19 @@ def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
     seq_len=4096,  cp=64 → chunk=64,    64%128=64   ✗ → NotImplementedError
   常见训练序列（4096 的整数倍）在常用 CP degree（≤32）下均自然满足，约束实际不会触发。
 
-  约束 S % (CP * 128) == 0，不满足直接 raise
+  约束 S % (CP * 128) == 0，不满足直接 raise（在模型初始化时调用一次即可）。
   
-  尾部 token 丢弃规则 （<mark style="background:#b1ffff">理论上应该用不上，我们这里对 seq_len 的大小有明确的约束</mark>）
-  seq_len=65536 时，S % 128 = 0，无丢弃
-  seq_len=65600 时（假设），65600 % 128 = 64，每 rank 丢弃本地 chunk 末尾 64 个 token                                                                                          
-  如果要丢弃必须发生在 compressor 内部，由各 rank 独立处理本地尾部。
+**尾部截断逻辑在 CP 路径下是死代码，无需保留**：
+对齐约束确立后，推论链如下：
+	seq_len % (cp_size * 128) == 0
+		→ chunk = seq_len / cp_size，则 chunk % 128 == 0
+		→ chunk % 4 == 0（128 可被 4 整除，隐含此结论）
+		→ compressor 内部的 cutoff = (chunk // ratio) * ratio == chunk，remainder = 0
+		→ `if remainder > 0` 分支永远不触发
+
+因此 CP 专用的 forward 函数（`compressor_forward_with_cp` 等）中
+不应保留截断逻辑；原始 `Compressor.forward()`（非 CP 路径）仍需保留，
+因为非 CP 场景没有对齐保证。
 
 ### 3.2.2 数据流设计
 
@@ -206,7 +215,6 @@ def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
   │       │    → local_window_kv: [B,chunk,512]                     │ ← 纯本地，无通信
   │       │                                                                                            │ 
   │       └─ Compressor (ratio=128)                                         │
-  │            → 截断尾部：x[:, :chunk//128*128]                     │ ← 本次设计中应该用不上
   │            → 压缩输出：[B, chunk//128, 512]                      │ ← 纯本地    
   └────────────────────────────────┘    
                 │   
@@ -479,14 +487,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 	  CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
 
 #### 3.3.2.2 对齐约束（这里应该可以省略，直接在C128A Compressor 中对齐就可以了）
-```python
-  def validate_c4a_cp_alignment(seq_len: int, cp_size: int) -> None:
-      if seq_len % (cp_size * 4) != 0:
-          raise NotImplementedError(
-              f"C4A requires seq_len % (cp_size * 4) == 0. "
-              f"Got seq_len={seq_len}, cp_size={cp_size}."
-          )
-```
+
 
 #### 3.3.2.3 通用 BoundaryExchange （Compressor 跨 rank 边界修正）
 
