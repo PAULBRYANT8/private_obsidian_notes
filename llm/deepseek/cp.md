@@ -445,10 +445,25 @@ query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]
 
 C4A（ratio=4）在注意力之前需要把全序列的 KV 压缩到 1/4，但压缩后的序列仍然很长（S/4），不能对所有压缩 token 都做 attention，否则计算量仍然很大。因此引入"先检索、再 attention"的两阶段设计：
 
-**第一阶段：Compressor（压缩）**
-Compressor 读取本 rank 的原始隐状态，通过 `wkv`（线性投影）和 `wgate`（门控权重）对每 ratio=4 个 token 做加权求和，压缩成 1 个 token，同时输出两路结果：
-- `kv_compressor [S/4, head_dim=512]`：保留完整语义，用于最终 attention 计算
-- `k_indexer [S/4, index_head_dim=128]`：轻量级 key，仅用于检索，维度更低
+**第一阶段：Compressor（压缩）+ Indexer 内部压缩**
+这两路压缩结果来自**两个独立的 Compressor 实例**，各有自己的 wkv / wgate 参数：
+
+| 实例                             | head_dim | 输出                       | 作用                |
+| ------------------------------ | -------- | ------------------------ | ----------------- |
+| 主 Compressor（PreAttention 中）   | 512      | kv_compressor [S/4, 512] | 用于实际 attention 计算 |
+| Indexer.compressor（Indexer 内部） | 128      | k_indexer [S/4, 128]     |                   |
+
+| 实例 | head_dim | 输出 | 用途 |
+
+|------|----------|------|------|
+
+| 主 `Compressor`（PreAttention 中） | 512 | `kv_compressor [S/4, 512]` | 实际 attention 计算 |
+
+| `Indexer.compressor`（Indexer 内部） | 128 | `k_indexer [S/4, 128]` | 检索用的轻量 key |
+
+  
+
+两者都对每 ratio=4 个 token 通过 wkv（投影特征）× wgate（门控权重）的加权求和压缩成 1 个 token，但学到的投影矩阵完全不同——主 Compressor 学习"语义压缩"，Indexer 内部 Compressor 学习"检索特征"。
 
 **第二阶段：Indexer（检索）**
 Indexer 用当前 query 与全局的 `k_indexer` 计算相关性分数（无 softmax，计算代价低），找出最相关的 top-k 个压缩 token 的位置索引，再用该索引从 `kv_compressor` 中取出对应行，只对这 top-k 个位置做完整 attention。
