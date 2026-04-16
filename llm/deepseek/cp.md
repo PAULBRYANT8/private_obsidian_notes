@@ -502,11 +502,26 @@ Indexer 检索：
 
 #### 3.3.2.2 通用 BoundaryExchange （Compressor 跨 rank 边界修正）
 
+score 是 wgate 的输出，经过 softmax 后作为每个槽的权重，决定 ratio 个 token（含 overlap 槽）各贡献多少到压缩结果。
+overlap_transform 的机制是：group i 的 overlap 槽 = group i-1 的 kv/score 的前 d 维。在 CP 模式下，rank r 的 group 0 的overlap 槽应该来自 rank r-1 最后一个 group 的数据。  
+
+如果只做 kv 的 BoundaryExchange，score 不做：                                                                                
+	rank r group 0 overlap 槽：
+	    kv    = 正确收到 rank r-1 的数据   ✓
+	    score = 仍然是 -inf（未更新）     ✗
+	最终：kv * softmax(-inf) = kv * 0 = 0
+		→ 即使 kv 正确，score 错了，overlap 贡献仍然为 0，计算结果错误
+  所以 kv 和 score 必须各自做一次 BoundaryExchange，缺一不可。
+
 > [!IMPORTANT] rank 0 的 score 初始化必须用 `-inf`，不能用 `0`
 > 原 `overlap_transform` 对 score 使用 `value=float("-inf")` 初始化，使得 rank 0 位置 0 的 overlap 槽权重经 softmax 后接近 0（正确行为）。
 > 若 `recv_score` 在 rank 0 时为全 0，softmax 后 overlap 槽会得到非零权重，与非 CP 行为不一致，产生训练偏差。
 >
-> 修复：kv 和 score 分两次 BoundaryExchange，各自使用正确的初始值。
+>softmax(-inf) = e^(-inf) / Z ≈ 0    ← 几乎无贡献，✓    
+  softmax(0)    = e^0      / Z = 1/Z  ← 正常的正数权重，✗
+>
+>所以需要修复：kv 和 score 分两次 BoundaryExchange，各自使用正确的初始值。
+
 
 ```python
 class BoundaryExchange(torch.autograd.Function):
@@ -551,14 +566,9 @@ recv_kv_slice = BoundaryExchange.apply(kv_last, cp_rank, cp_size, cp_group, 0.0)
 # score 边界交换：rank 0 接收全 -inf（与非 CP 一致，避免 softmax 权重错误）
 recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group, float("-inf"))
 ```
-  
-
-> **勘误**：原方案将 kv 和 score 拼在一起做单次 BoundaryExchange，recv_buf 统一初始化为
-> `zeros_like`。这导致 rank 0 的 recv_score 为 0 而非 -inf，使 `new_score[:, 0, :ratio]`
-> 被错误赋为 0，softmax 后 overlap 槽产生非零权重，与非 CP rank 0 行为不一致。
-> 改为分两次交换，各自使用正确的初始化值。
 
 #### 3.3.2.3 带 cp 边界修正的 compressor 前向
+
 ```python
  def compressor_forward_with_cp(
       compressor,          # Compressor 实例（overlap=True）
