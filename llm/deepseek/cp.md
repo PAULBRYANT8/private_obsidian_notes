@@ -121,6 +121,16 @@ def validate_cp_alignment(seq_len: int, cp_size: int) -> None:
 	用 q 对 kv_full 做 window attention，window_topk_idxs 告诉每个 query 访问 kv_full 中的哪 128 个位置，输出 o [B, chunk, head_dim]。
 
 
+> [!NOTE] 为什么要有第一步和第二步
+>   Attention 的本质是：用 Q 去查询 KV，找出序列中最相关的信息。但模型内部流动的是隐状态 x，它是一个"混合"的表示，不能直接当 Q 或 KV 用。需要通过线性投影把 x 分别"解码"成：Q（query）：代表"我现在想问什么"；KV（key-value）：代表"我能提供什么信息"。
+>   
+  两步的具体作用：
+  Q 投影：x → wq_a → wq_b，用两次矩阵乘法（低秩分解）把 x 投影成 Q。为什么两次？wq_a 先把维度压到一个低秩空间（q_lora_rank），wq_b 再展开到 n_heads × head_dim，这是 LoRA      
+  的思路，参数量更少。之后施加 RoPE 把位置信息编码进去。
+  KV 投影：x → wkv，一次矩阵乘法把 x 投影成 KV（在 Window Attention 和 C128A 里 K 和 V 共享同一个投影，即 MLA 的压缩 KV 设计）。之后同样施加 RoPE 把位置信息编码进去。
+
+
+
 > [!NOTE] ratio=1 和 发送 1 个 token 的区别
 > ratio=1 表示没有压缩，每个 token 的 KV 就是它本身，不会被合并成更少的 token。
 > Window Attention 的计算需求：Window Attention 中，每个 query 可以向左看 window_size=128 个原始 token；query 在全局位置 i -> 需要 KV 的位置来自 [i - 127, i]；
