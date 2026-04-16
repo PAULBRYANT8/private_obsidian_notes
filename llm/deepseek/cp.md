@@ -443,6 +443,16 @@ query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]
 
 ### 3.3.1 C4A 需要分成 Compressor 和 Indexer 的原因
 
+C4A（ratio=4）在注意力之前需要把全序列的 KV 压缩到 1/4，但压缩后的序列仍然很长（S/4），不能对所有压缩 token 都做 attention，否则计算量仍然很大。因此引入"先检索、再 attention"的两阶段设计：
+
+**第一阶段：Compressor（压缩）**
+Compressor 读取本 rank 的原始隐状态，通过 `wkv`（线性投影）和 `wgate`（门控权重）对每 ratio=4 个 token 做加权求和，压缩成 1 个 token，同时输出两路结果：
+- `kv_compressor [S/4, head_dim=512]`：保留完整语义，用于最终 attention 计算
+- `k_indexer [S/4, index_head_dim=128]`：轻量级 key，仅用于检索，维度更低
+
+**第二阶段：Indexer（检索）**
+Indexer 用当前 query 与全局的 `k_indexer` 计算相关性分数（无 softmax，计算代价低），找出最相关的 top-k 个压缩 token 的位置索引，再用该索引从 `kv_compressor` 中取出对应行，只对这 top-k 个位置做完整 attention。
+
 ```
 compressor：将原始 kv 压缩；
 	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
@@ -461,8 +471,11 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 		│
 	只对这 k 个位置做 attention
 ```
-<mark style="background:#affad1">k_indexer  只用来做“相关性排序”，不需要携带完整语义信息</mark>。维度低 -> 检索更快 -> top-k 计算的代价小
-<mark style="background:#affad1">kv_compressor 要参与真正的 attention 计算，需要保留完整表征</mark>。 维度高 -> 保留语义 -> attention 质量高
+
+<mark style="background:#affad1">k_indexer 只用来做"相关性排序"，不需要携带完整语义信息</mark>。维度低（128）→ 检索更快 → top-k 计算代价小。
+<mark style="background:#affad1">kv_compressor 要参与真正的 attention 计算，需要保留完整表征</mark>。维度高（512）→ 保留语义 → attention 质量高。
+
+这种设计的核心权衡是：**用低维 k_indexer 快速定位最相关的位置，再用高维 kv_compressor 精确计算**，避免对全量压缩序列做完整 attention 的计算开销。
 
 ### 3.3.2 C4A CP 方案设计
 #### 3.3.2.1 问题定位
