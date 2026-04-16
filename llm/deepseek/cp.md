@@ -97,6 +97,29 @@ def validate_cp_alignment(seq_len: int, cp_size: int) -> None:
 
 ## 3.1 ratio=1：Window Attention（P2P 边界通信）
 
+### 3.1.1 执行流程
+
+ 起点：每个 rank 持有本地隐状态 x [B, chunk, D]。
+ 
+ 第一步：Q 投影（本地）
+	对 x 做 wq_a → wq_b 两次线性投影，得到 q [B, chunk, n_heads, head_dim]，施加全局位置坐标的 RoPE（rank r 的起始位置是 r * chunk）。q 投影完后等待最后做 attention。
+
+第二步：Window KV 投影（本地）
+	对 x 做 wkv 投影，经 kv_norm 归一化，施加全局位置坐标的 RoPE，得到本地 kv [B, chunk, head_dim]。
+
+第三步：P2P 边界通信
+- rank r-1 把自己末尾 128 个 token 的 kv 通过 isend 发给 rank r，rank r 通过 irecv 接收，等待完成后拼接：
+	- rank r > 0：kv_full = cat([boundary_kv, local_kv]) → [B, 128+chunk, head_dim]
+	- rank 0：无前驱，kv_full = local_kv → [B, chunk, head_dim]  
+
+第四步：生成修正后的 window_topk_idxs
+- 拼入边界 token 后，kv_full 的索引空间发生变化，原始索引不再正确：
+	- rank 0：kv_full 就是本地 kv，索引从 0 开始，沿用原逻辑即可
+	- rank r > 0：boundary_kv 占据了 kv_full 的前 128 位，local_kv 整体偏移到 128 之后。query i 的窗口映射到 kv_full 后访问位置 [i+1, i+2, ..., i+128]，需要用cp_window_topk_idxs 重新生成 
+
+第五步：Attention 计算 
+	用 q 对 kv_full 做 window attention，window_topk_idxs 告诉每个 query 访问 kv_full 中的哪 128 个位置，输出 o [B, chunk, head_dim]。
+
 
 > [!NOTE] ratio=1 和 发送 1 个 token 的区别
 > ratio=1 表示没有压缩，每个 token 的 KV 就是它本身，不会被合并成更少的 token。
@@ -207,6 +230,40 @@ def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
 ---
 
 ## 3.2 C128A CP 切分完整设计方案
+
+### 3.2.1 执行流程
+
+起点：每个 rank 持有本地隐状态 x [B, chunk, D]。
+
+第一步：Q 投影（本地）
+	与 Window Attention 相同，wq_a → wq_b + 全局位置 RoPE，得到 q [B, chunk, n_heads, head_dim]，等待最后使用。                                                                  
+   
+第二步：Window KV 投影（本地）
+	对 x 做 wkv 投影 + kv_norm + 全局位置 RoPE，得到本地 window_kv [B, chunk, head_dim]。此路数据用于 window attention，后续还需要做 P2P 边界通信。                              
+   
+第三步：Compressor 压缩（本地，无通信）
+	对 x 用 ratio=128 的 Compressor 做压缩（overlap=False，无相邻 group 依赖，不需要 BoundaryExchange）：wkv + wgate 线性投影，每 128 个 token 加权求和压缩成 1 个token，施加全局位置 RoPE，得到 local_kv_compress [B, chunk//128, 512]。这一步完全本地，无任何跨 rank 通信。
+	
+第四步：Window KV P2P 边界通信 
+- 与 Window Attention 的第三步完全相同：rank r-1 把末尾 128 个 window_kv token 发给 rank r：
+	- rank r > 0：kv_full = cat([boundary_kv, window_kv]) → [B, 128+chunk, head_dim]
+	- rank 0：kv_full = window_kv → [B, chunk, head_dim] 
+- 同样需要用 cp_window_topk_idxs 重新生成修正后的窗口索引，并更新 offset（rank r > 0 时 offset = 128+chunk，rank 0 时 offset = chunk）。
+
+第五步：AllGather kv_compress 
+	各 rank 的 local_kv_compress 通过 AllGather 拼成 global_kv_compress [B, seq_len//128, 512]，每个 rank 拿到完整序列的压缩 KV。反向时自动变成 ReduceScatter。通信量极小（约 0.5MB/层，是 C4A 的 1/32）。
+
+第六步：因果裁剪 
+	从 global_kv_compress 中只保留 rank 0 到 rank r 的部分，去掉未来 rank 的数据，得到 causal_kv_compress [B, (cp_rank+1)*chunk//128, 512]。
+
+ 第七步：生成修正后的 compress_topk_idxs 
+	 C128A 不像 C4A 有 Lightning Indexer，top-k 索引直接用位置关系生成。关键修正：用 rank r 的全局 query 坐标作为 base（而非从 0 开始的本地坐标），生成因果掩码，确保每个 query   只访问自己位置之前的压缩 token。索引值以 kv_full 长度为 offset，与 SparseAttention 的寻址方式对齐。
+	 
+第八步：SparseAttention 
+- 用 q 同时做两路 attention：
+	- Window attention：q 对 kv_full 做注意力，使用修正后的 window_topk_idxs 确定每个 query 访问哪 128 个位置
+	- Compress attention：q 对 causal_kv_compress 做注意力，使用修正后的 compress_topk_idxs 确定访问哪些压缩 token 
+- 两路结果合并，输出 o [B, chunk, head_dim]。   
 
 ### 3.2.2 数据流设计
 
@@ -492,87 +549,43 @@ Indexer 检索：
 
 #### 3.3.2.0 整体执行流程
 
-```
-输入：x [B, chunk, D]（rank r 持有全局序列中的第 r 段）
-│
-├─────────────────────────────────────────┐
-▼                                         ▼
-【Q 投影】（纯本地，无通信）           【Window KV 投影】（纯本地，无通信）
-wq_a → q_lora_rank                         wkv → kv [B, chunk, head_dim]
-wq_b → q [B, chunk, n_heads, head_dim]     kv_norm + RoPE（使用全局位置坐标）
-RoPE（使用全局位置坐标）                     │
-│                                         ▼
-│                                 【Window KV 边界 P2P 通信】
-│                                 rank r-1 将末尾 128 token 发给 rank r
-│                                 rank 0 无前驱，boundary 填全 0
-│                              kv_full = cat([boundary_kv, kv]) ← rank r>0
-│                                 kv_full = kv ← rank 0
-│                                 【cp_window_topk_idxs 修正】
-│                               boundary 拼入后索引空间扩大，需重新生成窗口索引
-│
-├─────────────────────────────────────────┐
-▼                                    （q 继续向下传递）
-【Indexer 前向（with CP，不传梯度）】
-│
-├──【内部 Compressor（head_dim=128）】
-│   wkv + wgate → 线性投影
-│   BoundaryExchange(kv, init=0) + BoundaryExchange(score, init=-inf)
-│   手动 overlap_transform：group 0 的 overlap 槽填入跨 rank 边界数据
-│   加权求和压缩 + RoPE(全局位置) → k_indexer_local [B, chunk//4, 128]
-│
-└──【q_indexer + weights（纯本地）】
-    wq_b → q_indexer [B, chunk, n_heads, 128]（使用全局位置 RoPE）
-    weights_proj → weights [B, chunk, n_heads]
-│
-▼
-【AllGather k_indexer】
-将各 rank 的 k_indexer_local 拼接，所有 rank 得到完整压缩序列的检索 key
-global_k_indexer [B, seq_len//4, 128]
-│
-▼
-【LiCompute（全局坐标修正）】
-q_indexer × global_k_indexer → index_score [B, chunk, seq_len//4]
-用 rank r 的全局 query 位置生成因果掩码（屏蔽未来 token）
-top-k 选择 → compress_topk_idxs（以 kv_full 长度为 offset 的全局索引）
-│
-▼
-【主 Compressor 前向（with CP，head_dim=512）】
-wkv + wgate → kv/score [B, chunk, 2*head_dim]
-│
-├── BoundaryExchange(kv_last, init=0.0 ) → recv_kv [B, 1, 4, d]
-└── BoundaryExchange(score_last, init=-inf) → recv_score [B, 1, 4, d]
-    （两次分开：rank 0 的初始值不同，kv=0 / score=-inf）
-│
-手动 overlap_transform（带 CP 修正）：
-    group 0 的 overlap 槽 ← recv_kv / recv_score（跨 rank 边界数据）
-    group 1..N-1 的 overlap 槽 ← 本 rank 前一个 group（纯本地 shift）
-加权求和压缩 (kv * softmax(score)).sum() + RoPE(全局位置)
-→ local_kv_compress [B, chunk//4, 512]
-│
-▼
-【AllGather kv_compress】
-将各 rank 的 local_kv_compress 拼接，所有 rank 得到完整压缩 KV
-global_kv_compress [B, seq_len//4, 512]
-│
-▼
-【因果裁剪】
-只保留 rank 0..r 的数据，去掉未来 rank 的压缩 token（满足因果注意力）
-causal_kv_compress [B, (cp_rank+1)*chunk//4, 512]
-│
-▼
-【SparseAttention】（q 来自最顶部的 Q 投影）
-├── Window Attention：q × kv_full（本地 chunk + 来自 rank r-1 的 128 个边界 token）
-│ 使用修正后的 cp_window_topk_idxs 确定每个 query 访问哪些 kv 位置
-└── Compress Attention：q × causal_kv_compress 中 compress_topk_idxs 指定的 top-k 行
-两路结果合并 → o [B, chunk, n_heads, head_dim]
-│
-▼
+起点：每个 rank 持有本地隐状态 x [B, chunk, D]，chunk = seq_len / cp_size。                                                       
+第一步：Q 投影（本地）
+	对 x 做两次线性投影（wq_a → wq_b），得到主 attention 用的 query q [B, chunk, n_heads, head_dim]。施加 RoPE 时用全局位置坐标（rank r 的起始位置是 r * chunk）。q 投影完之后一直等到最后 SparseAttention 才被使用。                                                                                                                                                                          
+第二步：Window KV 投影 + P2P 边界通信（本地投影 + 跨 rank 通信）
+	对 x 做 wkv 投影得到本地 kv [B, chunk, head_dim]，施加全局位置 RoPE。
+	投影完成后做 P2P 通信：rank r-1 把自己末尾 128 个 token 的 kv 发给 rank r，rank r 收到后拼接到自己 kv 的前面，得到 kv_full [B, 128+chunk, head_dim]。rank 0 没有前驱，kv_full就等于本地 kv。
+	拼接之后还需要重新生成窗口注意力索引 window_topk_idxs，因为 kv_full 比原来多了 128 个 token，原来的索引范围不正确。                                                                                                                                                                          
+第三步：Indexer 前向（本地 + 跨 rank 通信，不传梯度）
+- 这一步并行产出三个结果：
+	- k_indexer_local [B, chunk//4, 128]：由 Indexer 内部的 Compressor（head_dim=128）对 x 压缩得到。压缩时同样有 overlap 边界问题，需要和主 Compressor 一样做两次BoundaryExchange（kv init=0，score init=-inf），然后手动执行 overlap_transform 修正 group 0 的边界槽。 
+	- q_indexer [B, chunk, n_heads, 128]：由 wq_b 对 qr 投影得到，纯本地，施加全局位置 RoPE。
+	- weights [B, chunk, n_heads]：由 weights_proj 对 x 投影得到，纯本地。
 
-输出：o [B, chunk, head_dim]
+第四步：AllGather k_indexer  
+	各 rank 的 k_indexer_local 通过 AllGather 拼接成 global_k_indexer [B, seq_len//4, 128]，每个 rank 都拿到完整序列的检索 key。反向时自动变成 ReduceScatter。
+	
+第五步：LiCompute top-k 选择 
+- 用本地 q_indexer 与 global_k_indexer 做点积，得到每个 query 对所有压缩 token 的相关性分数，再乘以 weights 聚合各头。
+- 关键修正：生成因果掩码时用 rank r 的全局 query 坐标（而非从 0 开始的本地坐标），屏蔽掉未来位置的压缩 token。
+- 最终 top-k 得到 compress_topk_idxs，索引以 kv_full 的长度为 offset（因为 SparseAttention 里 kv_full 和 kv_compress 是拼在一起寻址的）。                                                                                                                                                                          
+第六步：主 Compressor 前向（本地 + 跨 rank 通信）
+- 对 x 做 wkv + wgate 投影，reshape 成 group 视图后，做两次 BoundaryExchange：
+	- kv：rank r-1 最后一个 group 的前 d 维发给 rank r，rank 0 收到全 0
+	- score：同上，rank 0 收到全 -inf
+- 然后手动执行 overlap_transform，将收到的跨 rank 数据填入 group 0 的 overlap 槽，其余 group 的 overlap 槽用本地前一个 group 的数据填入。
+- 之后做 softmax 加权求和压缩，施加全局位置 RoPE，得到 local_kv_compress [B, chunk//4, 512]。 
 
-（同时输出 LiLoss 作为 Indexer 的辅助训练损失）
-
-```
+第七步：AllGather kv_compress + 因果裁剪
+- 各 rank 的 local_kv_compress 通过 AllGather 拼成 global_kv_compress [B, seq_len//4, 512]。
+- 然后因果裁剪：rank r 只保留前 (r+1) * chunk//4 个，去掉未来 rank 的数据，得到 causal_kv_compress。                                                                                                                                                                          
+第八步：SparseAttention
+- 用第一步的 q，同时做两路 attention：
+	- Window attention：q 对 kv_full 做注意力，用修正后的 window_topk_idxs 确定每个 query 访问 kv_full 中的哪 128 个位置
+	- Compress attention：q 对 causal_kv_compress 做注意力，只访问 compress_topk_idxs 指定的 top-k 行 
+- 两路结果合并输出 o [B, chunk, head_dim]。
+- 同时计算 LiLoss（辅助损失），用于训练 Indexer 使其检索结果更准确，通过单独的梯度路径反传。      
+  
 #### 3.3.2.1 问题定位
 
   C4A compressor 使用 overlap=True，其 overlap_transform 使第 i 个压缩 token 依赖第 i-1 个 group 的数据：
