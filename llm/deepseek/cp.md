@@ -674,12 +674,11 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 ```
 
 #### 3.3.2.3 带 cp 边界修正的 compressor 前向
-`compressor_forward_with_cp` 是非 CP 版 `Compressor.forward()` 的 CP 替代实现。原始 `Compressor.forward()` 直接调用 `overlap_transform` 时，group 0 的 overlap 槽默认填 0（kv）或 -inf（score），这在非 CP 下是正确的——group 0 就是序列起点，没有前驱 group。但 CP 切分后，rank r 的 group 0 并不是全局序列的起点，它的 overlap 槽应填入 rank r-1 最后一个 group 的边界数据，直接调用原始函数会导致 group 0 的压缩结果错误。
 
-该函数的作用是在保留原始压缩逻辑不变的前提下，通过以下三处修正使 CP 路径的输出与非 CP 完全等价：
-- **P2P 边界交换**：在执行 overlap_transform 之前，先用 `BoundaryExchange` 从 rank r-1 取得边界数据。kv 和 score 各做一次，init_value 分别为 0 和 -inf，确保 rank 0 的默认行为与非 CP 一致。
-- **手动 overlap_transform**：不再调用原始 `overlap_transform`，而是手动展开其逻辑，将 group 0 的 overlap 槽替换为从 rank r-1 收到的边界数据，其余 group 的处理方式与原始函数完全相同。
-- **全局位置 RoPE**：压缩完成后施加 RoPE 时，用 `cp_rank * chunk_size` 作为全局起点取 freqs_cis，而非从位置 0 开始，确保各 rank 的压缩 token 携带正确的全局位置信息。
+`compressor_forward_with_cp` 是非 CP 版 `Compressor.forward()` 的 CP 替代实现，将 3.3.2.1 定位的问题和 3.3.2.2 定义的 `BoundaryExchange` 工具整合在一起，对原始压缩流程做三处修正：
+1. **P2P 边界交换**：调用 3.3.2.2 的 `BoundaryExchange`，在执行 overlap_transform 之前取得 rank r-1 的边界数据
+2. **手动 overlap_transform**：展开原始 `overlap_transform` 逻辑，将 group 0 的 overlap 槽替换为收到的跨 rank 数据，其余 group 不变
+3. **全局位置 RoPE**：施加 RoPE 时从 `cp_rank * chunk_size` 处取 freqs_cis，而非从位置 0 开始
 
 ```python
  def compressor_forward_with_cp(
@@ -746,6 +745,23 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 ```
 
 #### 3.3.2.4 Indexer 前向（两个 Compressor 相互独立 BoundaryExchange ）
+
+为什么不能直接使用非 CP 版 `Indexer.forward()`：
+- 原因一：内部 Compressor 的 overlap 边界问题 —— 原始 Indexer.forward() 内部调用的是 self.compressor(x, freqs_cis)，即原始的 Compressor.forward()。CP 切分后，这个内部 Compressor 的 group 0 overlap槽同样会错误地保持默认值（kv=0，score=-inf），而不是来自 rank r-1 的真实边界数据。这个问题在 3.3.2.1 里分析的是主 Compressor，但 Indexer 内部的 Compressor 结构完全相同（同样overlap=True，ratio=4），问题一模一样。原始函数没有任何 BoundaryExchange 逻辑，调用它会导致 k_indexer 的 group 0 压缩结果错误，最终影响 top-k 检索的准确性。
+- 原因二：RoPE 使用了本地位置坐标 —— 原始 Indexer.forward() 对 q_indexer 和内部 Compressor 施加 RoPE 时，freqs_cis 从位置 0 开始取。CP 切分后 rank r 的 chunk 在全局序列中的起始位置是 r * chunk，如果仍从位置 0取，各 rank 的位置编码会重叠，所有 rank 都认为自己的 token 在序列最前面，q_indexer 和 k_indexer 的位置信息混乱，检索结果不可信。
+- 两个问题叠加，直接调用原始函数会同时产生错误的压缩边界和错误的位置编码，所以必须用 indexer_forward_with_cp 替代。
+
+`indexer_forward_with_cp` 是非 CP 版 `Indexer.forward()` 的 CP 替代实现，负责产出 LiCompute top-k 检索所需的三个输入：`k_indexer`、`q_indexer`、`weights`。
+
+函数分为两个相互独立的部分：
+**上半部分：k_indexer（有跨 rank 通信）** —— Indexer 内部有自己的 Compressor（head_dim=128），对 x 做压缩得到 `k_indexer`。这个内部 Compressor 同样使用 overlap=True，存在与主 Compressor 完全相同的 group 0 overlap 边界问题。解决方式也完全相同——直接复用 3.3.2.2 的 `compressor_forward_with_cp`，只是传入的实例换成 `indexer.compressor`。两个 Compressor 实例各自独立地做 BoundaryExchange，互不干扰。压缩完成后对结果做 Hadamard 旋转（`rotate_activation`），为后续点积计算做特征对齐。
+
+**下半部分：q_indexer 和 weights（纯本地，无通信）**
+- `q_indexer`：由 wq_b 对 qr（query 的 lora 中间表示）投影得到，施加全局位置坐标的 RoPE 后做 Hadamard 旋转。纯本地操作，不需要任何通信。
+- `weights`：由 weights_proj 对 x 投影得到，作为各注意力头的重要性缩放系数。纯本地操作。
+
+**为什么 q_indexer 和 weights 不需要 AllGather：** `k_indexer` 是 KV 侧的压缩表示，每个 rank 只有局部序列的 k_indexer，需要 AllGather 才能让所有 rank 看到全局序列；而 `q_indexer` 和 `weights` 是 Query 侧的表示，每个 rank 只需要对自己的本地 query 做检索，用本地的 q_indexer 和 weights 配合全局 k_indexer（AllGather 在 3.3.2.4 完成）即可，不需要提前聚合。
+
 ```python
  def indexer_forward_with_cp(
       indexer,             # Indexer 实例
@@ -796,6 +812,16 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 ```
 
 #### 3.3.2.6 LiCompute CP 修正
+
+`li_compute_with_cp` 是非 CP 版 `LiCompute` 的 CP 替代实现，负责用 `q_indexer` 与 `global_k_indexer` 计算相关性分数，并选出每个 query 最相关的 top-k 个压缩 token 的索引（`compress_topk_idxs`）。
+
+**解决什么问题：** 原始 `LiCompute` 在生成因果掩码时，用本地坐标 `base = arange(seqlen)` 表示 query 的位置，即默认所有 query 的位置从 0 开始。CP 切分后，rank r 的 chunk 在全局序列中的起始位置是 `r * chunk`，本地第 i 个 query 的真实全局位置是 `r * chunk + i`。如果仍用本地坐标 0..chunk-1 作为 base，因果掩码会认为 rank r 的 query 只能看到压缩序列前 chunk//4 个 token，而实际上它能看到 `(r+1) * chunk//4` 个，导致大量本来合法的历史压缩 token 被错误屏蔽，top-k 结果严重偏差。
+
+**三处关键修正：**
+1. **全局 query 坐标**：`base = cp_rank * chunk_size + arange(chunk_size)`，用全局位置而非本地位置生成因果掩码，确保每个 query 能正确看到自己位置之前的所有压缩 token
+2. **top-k 上限收缩**：rank r 实际能看到的压缩 token 最多只有 `(cp_rank+1) * chunk//ratio` 个（只有当前及之前 rank 的数据），取 top-k 时将 k 限制在这个范围内，避免选出未来 rank 的无效索引
+3. **offset 对齐**：返回的 `compress_topk_idxs` 索引值加上 `offset`（= kv_full 的长度），与 SparseAttention 内部 `cat([kv_full, causal_kv_compress])` 的寻址方式对齐；对不合法位置（未来 token）填 -1 供 SparseAttention 跳过
+
 ```python
   def li_compute_with_cp(
       li_compute,          # LiCompute 实例
@@ -843,7 +869,6 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 > 原方案仅处理了 Compressor 的跨 rank 边界，遗漏了 Window KV 的边界通信。
 >
 > 修复：在 Window KV 投影后，执行与 3.1 节相同的 P2P 通信 + window_topk_idxs 修正。
-
 
 ```python
   def c4a_attention_forward_with_cp(
