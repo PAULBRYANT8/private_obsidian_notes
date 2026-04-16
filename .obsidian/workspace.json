@@ -124,12 +124,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "每日知识总结.md",
+                "file": "llm/deepseek/cp.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from 每日知识总结"
+              "title": "cp 的出链列表"
             }
           },
           {
@@ -144,7 +144,7 @@
                 "searchQuery": ""
               },
               "icon": "lucide-tags",
-              "title": "Tags"
+              "title": "标签"
             }
           },
           {
@@ -175,8 +175,19 @@
               "icon": "lucide-list",
               "title": "Outline of 每日知识总结"
             }
+          },
+          {
+            "id": "9e3293d4feb2a878",
+            "type": "leaf",
+            "state": {
+              "type": "github-issue-controls-view",
+              "state": {},
+              "icon": "github",
+              "title": "Github Issue Controls"
+            }
           }
-        ]
+        ],
+        "currentTab": 5
       }
     ],
     "direction": "horizontal",
