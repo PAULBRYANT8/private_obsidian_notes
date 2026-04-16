@@ -564,7 +564,6 @@ causal_kv_compress [B, (cp_rank+1)*chunk//4, 512]
 ├── Window Attention：q × kv_full（本地 chunk + 来自 rank r-1 的 128 个边界 token）
 │ 使用修正后的 cp_window_topk_idxs 确定每个 query 访问哪些 kv 位置
 └── Compress Attention：q × causal_kv_compress 中 compress_topk_idxs 指定的 top-k 行
-
 两路结果合并 → o [B, chunk, n_heads, head_dim]
 │
 ▼
