@@ -29,7 +29,9 @@ if (
 ---
 # 一、问题本质分析
 
-  compress_ratios 的模式是 (1, 1, 4, 128, 4, 128, ..., 4, 128, 4)，三类层对应三种不同的序列依赖范围：
+DeepSeek-2026 的每个 Transformer Block 包含两大组件：**MHC（Multi-Head Hyper-Connections）** 和 **Attention**。
+CP 切分的挑战主要来自 Attention，不同层的 compress_ratio 决定了序列依赖的范围和通信开销。
+`compress_ratios` 的模式是 `(1, 1, 4, 128, 4, 128, ..., 4, 128, 4)`，共三类 Attention 层：
 
 | 层类型                | 序列依赖范围                        | 通信挑战                 |
 | ------------------ | ----------------------------- | -------------------- |
@@ -37,7 +39,19 @@ if (
 | ratio = 4（C4A）     | 全局（Lightning Indexer 选 top-k） | 压缩 KV 的全局 all-gather |
 | ratio = 128（C128A） | 全局（但 token 数极少）               | 压缩 KV 的全局 all-gather |
 
-  HC（Hyper-Connections）完全是 per-token 的局部操作，不需要任何 CP 通信。
+**ratio = 1（Window Attention）**：每个 query 只向左看 `window_size=128` 个原始 token，依赖范围纯局部。CP 切分后，rank r 最前面的若干 query 的窗口会跨越到 rank r-1 的末尾，因此只需要一次轻量的 P2P 通信，从前驱 rank 借来末尾 128 个 token 的 KV 即可，通信量极小（约 131 KB/层）。
+
+**ratio = 4（C4A）**：每 4 个原始 token 被 Compressor 压缩为 1 个压缩 token，再由 Lightning Indexer 从全局压缩序列中检索 top-k 个最相关的压缩 token 参与 attention。这意味着每个 query 的 KV 依赖分散在整个序列上，CP 切分后必须通过 AllGather 将各 rank 的本地压缩 KV 汇聚成全局视图。此外，C4A 的 Compressor 使用 `overlap=True`，相邻压缩 token 之间存在跨 group 依赖，CP 边界处还需要额外的 P2P 边界修正。
+
+**ratio = 128（C128A）**：与 C4A 原理相同，但压缩比高达 128:1，全局压缩序列极短（例如 seqlen=65536 时仅 512 个压缩 token）。Compressor 使用 `overlap=False`，无跨 group 依赖，不需要 P2P 边界修正。AllGather 的通信量相比 C4A 缩小 32 倍（约 0.5 MB/层），几乎可以忽略。
+
+
+**关于 MHC（Multi-Head Hyper-Connections）**
+> [!NOTE] 模型用的是 MHC，不是单头 HC
+> 代码中 `hc_mult=4`，每个 token 的隐藏状态形状为 `[B, S, 4, D]`，即每个位置
+> 维护 4 个并行 stream，这是 MHC（Multi-Head Hyper-Connections）而非单头 HC。
+
+MHC 是纯 **per-token** 的局部操作：HcPre / HcPost 的 Sinkhorn 路由只在同一 token 的 `hc_mult=4` 个 stream 之间做加权混合，**不涉及任何跨 token 的序列交互**。CP 将序列按 token 切分，同一 token 的 4 个 stream 始终在同一 rank 上，因此 MHC **不需要任何 CP 通信**。
   
   ---
 # 二、前提：Chunk 对齐约束（chunk 就是每个 cp rank 持有的本地序列片段）
