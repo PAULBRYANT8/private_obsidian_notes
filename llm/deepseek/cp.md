@@ -443,55 +443,51 @@ query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]
 
 ### 3.3.1 C4A 需要分成 Compressor 和 Indexer 的原因
 
-C4A（ratio=4）在注意力之前需要把全序列的 KV 压缩到 1/4，但压缩后的序列仍然很长（S/4），不能对所有压缩 token 都做 attention，否则计算量仍然很大。因此引入"先检索、再 attention"的两阶段设计：
+C4A（ratio=4）在注意力之前需要把全序列的 KV 压缩到 1/4，但压缩后的序列仍然很长（S/4），不能对所有压缩 token 都做 attention，否则计算量仍然很大。因此引入"先检索、再 attention"的两阶段设计：这两个阶段都用 wkv 提取特征、wgate提供门控权重，两者逐元素相乘后在 ratio 维度 softmax + sum 完成压缩。
 
 **第一阶段：Compressor（压缩）+ Indexer 内部压缩**
 这两路压缩结果来自**两个独立的 Compressor 实例**，各有自己的 wkv / wgate 参数：
 
 | 实例                             | head_dim | 输出                       | 作用                |
-| ------------------------------ | -------- | ------------------------ | ----------------- |
+| :----------------------------- | :------- | :----------------------- | :---------------- |
 | 主 Compressor（PreAttention 中）   | 512      | kv_compressor [S/4, 512] | 用于实际 attention 计算 |
-| Indexer.compressor（Indexer 内部） | 128      | k_indexer [S/4, 128]     |                   |
+| Indexer.compressor（Indexer 内部） | 128      | k_indexer [S/4, 128]     | 检索用的轻量 key        |
 
-| 实例 | head_dim | 输出 | 用途 |
 
-|------|----------|------|------|
-
-| 主 `Compressor`（PreAttention 中） | 512 | `kv_compressor [S/4, 512]` | 实际 attention 计算 |
-
-| `Indexer.compressor`（Indexer 内部） | 128 | `k_indexer [S/4, 128]` | 检索用的轻量 key |
-
-  
-
-两者都对每 ratio=4 个 token 通过 wkv（投影特征）× wgate（门控权重）的加权求和压缩成 1 个 token，但学到的投影矩阵完全不同——主 Compressor 学习"语义压缩"，Indexer 内部 Compressor 学习"检索特征"。
+两个实例都是同一个 `Compressor` 类，内部均各自持有独立的 wkv 和 wgate，计算流程相同：`kv = (wkv(x) * wgate(x).softmax()).sum()`，对每 ratio=4 个 token 加权求和压缩成 1 个 token。区别仅在于输出 head_dim 不同（512 vs 128），以及各自独立的参数通过训练学到了不同的投影——一套偏向语义保留，一套偏向检索相关性。
 
 **第二阶段：Indexer（检索）**
-Indexer 用当前 query 与全局的 `k_indexer` 计算相关性分数（无 softmax，计算代价低），找出最相关的 top-k 个压缩 token 的位置索引，再用该索引从 `kv_compressor` 中取出对应行，只对这 top-k 个位置做完整 attention。
+Indexer 用当前 query 与全局的 `k_indexer` 计算相关性分数（低维点积，无 softmax，代价低），找出最相关的 top-k 个压缩 token 的位置索引，再用该索引从 `kv_compressor` 中取出对应行，只对这 top-k 个位置做完整 attention。
 
 ```
-compressor：将原始 kv 压缩；
-	输出两路：kv_compressor  [S/4, 512]  -> 实际 attention 用的 KV
-			  k_indexer  [S/4, 128]  ->  检索用的轻量 kv
+主 Compressor（head_dim=512）：
+	原始隐状态 x [S, dim]
+		│ wkv + wgate，每 4 token 压缩为 1
+		▼
+	kv_compressor [S/4, 512] → 实际 attention 用的 KV
 
-indexer：在压缩 KV 中找出最相关的 top-k；
-	q    [chunk, head_dim]
+Indexer 内部 Compressor（head_dim=128）：
+	原始隐状态 x [S, dim]
+		│ wkv + wgate，每 4 token 压缩为 1
+		▼
+	k_indexer [S/4, 128] → 检索用的轻量 key
+
+Indexer 检索：
+	q [chunk, head_dim]
 		│
-	k_indexer [S/4, 128]  <-  轻量 key
-		│
-	计算相关性分数（无 softmax，轻量）
+	k_indexer [S/4, 128] ← 低维相关性计算（O(S/4 × 128)）
 		│
 	top-k 位置索引
 		│
-	用索引从  kv_compressor 中取出 top-k 行
+	用索引从 kv_compressor 中取出 top-k 行
 		│
-	只对这 k 个位置做 attention
+	只对这 k 个位置做完整 attention（O(k × 512)）
 ```
 
-<mark style="background:#affad1">k_indexer 只用来做"相关性排序"，不需要携带完整语义信息</mark>。维度低（128）→ 检索更快 → top-k 计算代价小。
+<mark style="background:#affad1">k_indexer 只用来做"相关性排序"，不需要携带完整语义信息</mark>。维度低（128）→ 检索更快 → top-k 计算代价小（O(S/4 × 128)，而非 O(S × 512)）。
 <mark style="background:#affad1">kv_compressor 要参与真正的 attention 计算，需要保留完整表征</mark>。维度高（512）→ 保留语义 → attention 质量高。
 
-这种设计的核心权衡是：**用低维 k_indexer 快速定位最相关的位置，再用高维 kv_compressor 精确计算**，避免对全量压缩序列做完整 attention 的计算开销。
-
+这种设计的核心权衡是：**先均匀压缩（S → S/4），再用低维 k_indexer 快速定位最相关的位置，最后只对 top-k 个位置用高维 kv_compressor 做精确计算**，把选择代价从 O(S × 512) 压缩到 O(S/4 × 128)。
 ### 3.3.2 C4A CP 方案设计
 #### 3.3.2.1 问题定位
 
@@ -502,13 +498,13 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 	  非 CP（正确）：  compressed[0 of rank r] = f(group_k,  group_{k-1})  ✓
 	  CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
 
+![[Pasted image 20260416145328.png]]
+
 #### 3.3.2.2 通用 BoundaryExchange （Compressor 跨 rank 边界修正）
 
 > [!IMPORTANT] rank 0 的 score 初始化必须用 `-inf`，不能用 `0`
-> 原 `overlap_transform` 对 score 使用 `value=float("-inf")` 初始化，
-> 使得 rank 0 位置 0 的 overlap 槽权重经 softmax 后接近 0（正确行为）。
-> 若 `recv_score` 在 rank 0 时为全 0，softmax 后 overlap 槽会得到非零权重，
-> 与非 CP 行为不一致，产生训练偏差。
+> 原 `overlap_transform` 对 score 使用 `value=float("-inf")` 初始化，使得 rank 0 位置 0 的 overlap 槽权重经 softmax 后接近 0（正确行为）。
+> 若 `recv_score` 在 rank 0 时为全 0，softmax 后 overlap 槽会得到非零权重，与非 CP 行为不一致，产生训练偏差。
 >
 > 修复：kv 和 score 分两次 BoundaryExchange，各自使用正确的初始值。
 
