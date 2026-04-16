@@ -58,13 +58,39 @@ CP 按序列维度 S 切分，rank r 持有位置 `[r*chunk, (r+1)*chunk)`。对
   ---
 # 二、前提：Chunk 对齐约束（chunk 就是每个 cp rank 持有的本地序列片段）
 
-  必要条件：chunk_size = seqlen / cp_degree 必须能被 128 整除。
+必要条件：`chunk_size = seqlen / cp_degree` 必须能被 128 整除，等价于：
+```python
+seq_len % (cp_size * 128) == 0
+```
 
-  seqlen=65536, cp=8  →  chunk=8192, 8192/128=64 ✓
-  seqlen=4096,  cp=8  →  chunk=512,  512/128=4   ✓
-  seqlen=4096,  cp=32 →  chunk=128,  128/128=1   ✓
+验证：
+```
+seqlen=65536, cp=8 → chunk=8192, 8192 % 128 = 0 ✓
+seqlen=4096, cp=8 → chunk=512, 512 % 128 = 0 ✓
+seqlen=4096, cp=32 → chunk=128, 128 % 128 = 0 ✓
+seqlen=4096, cp=64 → chunk=64, 64 % 128 = 64 ✗ → NotImplementedError
+```
 
-  这样所有层的压缩边界都与 CP 切分边界自然对齐，无碎片问题。
+这样所有层的压缩边界都与 CP 切分边界自然对齐，无碎片问题。此约束同时隐含 `chunk % 4 == 0`，因此**一个校验覆盖全部三类层**（ratio=1 / ratio=4 / ratio=128）。
+
+约束校验在**模型初始化时调用一次**，后续所有 CP 专用 forward 函数均不再重复校验：
+```python
+def validate_cp_alignment(seq_len: int, cp_size: int) -> None:
+	"""
+	统一的 CP 对齐校验。
+	seq_len % (cp_size * 128) == 0 是最强约束，同时隐含：
+	- chunk % 128 == 0 （C128A Compressor 无截断）
+	- chunk % 4 == 0 （C4A Compressor 无截断）
+	- chunk % 1 == 0 （Window Attention 无特殊要求）
+	常见训练序列（4096 的整数倍）在常用 CP degree（≤32）下均自然满足。
+	"""
+	if seq_len % (cp_size * 128) != 0:
+		raise NotImplementedError(
+			f"CP requires seq_len % (cp_size * 128) == 0. "
+			f"Got seq_len={seq_len}, cp_size={cp_size}, "
+			f"remainder={seq_len % (cp_size * 128)}."
+		)
+```
   
   ---
 # 三、三类不同层的 CP 通信设计
@@ -262,20 +288,7 @@ C128A 层的 `SparseAttention` 同样调用 `GetWindowTopkIdxs`，因此与 rati
 
 ### 3.2.5 伪代码实现
 
-#### 3.2.5.1 对齐校验
-```python
-def validate_c128a_cp_alignment(seq_len: int, cp_size: int) -> None:
-      ratio = 128
-      if seq_len % (cp_size * ratio) != 0:
-          raise NotImplementedError(
-              f"C128A requires seq_len % (cp_size * {ratio}) == 0. "
-              f"Got seq_len={seq_len}, cp_size={cp_size}, "
-              f"remainder={seq_len % (cp_size * ratio)}. "
-              f"Use seq_len that is a multiple of {cp_size * ratio}."
-          )
-```
-
-#### 3.2.5.2 Autograd-aware AllGather(前向 All-Gather，反向自动 Reduce-Scatter)
+#### 3.2.5.1 Autograd-aware AllGather(前向 All-Gather，反向自动 Reduce-Scatter)
 ```python
 class AllGatherCompressedKV(torch.autograd.Function):
       """         
@@ -328,7 +341,7 @@ def allgather_kv_compress(
       return AllGatherCompressedKV.apply(local_kv, group)
 ```
 
-#### 3.2.5.3 C128A 的 compress_topk_idxs 全局坐标修正
+#### 3.2.5.2 C128A 的 compress_topk_idxs 全局坐标修正
 
 > [!IMPORTANT] 不能沿用原 GetCompressTopkIdxs 生成的索引
 > 原 `GetCompressTopkIdxs` 以本地 `seqlen`（即 chunk）为上界生成索引，例如
@@ -382,7 +395,7 @@ query i=0 全局位置 3585 → compress_pos < 3585//128=28 → 可用 [0..27]
 query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]（全量）
 ```
 
-#### 3.2.5.4 C128A 前向主逻辑
+#### 3.2.5.3 C128A 前向主逻辑
 ```python
   def c128a_forward_with_cp(
       x: torch.Tensor,              # [B, chunk, D]
@@ -398,9 +411,6 @@ query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]
   ) -> torch.Tensor:
       B, chunk, D = x.shape
       ratio = 128
-      
-      # ── 0. 校验（仅在首次调用或 debug 模式下执行）──────────────────────────  
-      # validate_c128a_cp_alignment(seq_len, cp_size)  # 建议在模型初始化时调用
       
       # ── 1. 本地 Window KV（纯本地投影）────────────────────────────────────
       local_window_kv = window_proj(x) # [B, chunk, head_dim=512]
@@ -486,10 +496,7 @@ indexer：在压缩 KV 中找出最相关的 top-k；
 	  非 CP（正确）：  compressed[0 of rank r] = f(group_k,  group_{k-1})  ✓
 	  CP 无处理：      compressed[0 of rank r] = f(group_k,  0)            ✗
 
-#### 3.3.2.2 对齐约束（这里应该可以省略，直接在C128A Compressor 中对齐就可以了）
-
-
-#### 3.3.2.3 通用 BoundaryExchange （Compressor 跨 rank 边界修正）
+#### 3.3.2.2 通用 BoundaryExchange （Compressor 跨 rank 边界修正）
 
 > [!IMPORTANT] rank 0 的 score 初始化必须用 `-inf`，不能用 `0`
 > 原 `overlap_transform` 对 score 使用 `value=float("-inf")` 初始化，
@@ -549,7 +556,7 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 > 被错误赋为 0，softmax 后 overlap 槽产生非零权重，与非 CP rank 0 行为不一致。
 > 改为分两次交换，各自使用正确的初始化值。
 
-#### 3.3.2.4 带 cp 边界修正的 compressor 前向
+#### 3.3.2.3 带 cp 边界修正的 compressor 前向
 ```python
  def compressor_forward_with_cp(
       compressor,          # Compressor 实例（overlap=True）
@@ -567,11 +574,8 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
       kv    = compressor.wkv(x_f)    # [B, chunk, 2*head_dim]
       score = compressor.wgate(x_f)  # [B, chunk, 2*head_dim]
 
-      # ── Step 2：截断尾部（chunk%ratio==0 时无截断）────────────────────────
-      cutoff = (chunk // ratio) * ratio
-      if cutoff < chunk:
-          kv    = kv[:, :cutoff]
-          score = score[:, :cutoff]
+      # ── Step 2：确定有效长度 ────────────────────────
+      cutoff = chunk
 
       # ── Step 3：reshape 为 group 视图 ────────────────────────────────────
       kv_g    = kv.unflatten(1, (-1, ratio))  # [B, chunk//4, 4, 2*d]
@@ -617,7 +621,7 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
       return out   # [B, chunk//4, head_dim]
 ```
 
-#### 3.3.2.5 Indexer 前向（两个 Compressor 相互独立 BoundaryExchange ）
+#### 3.3.2.4 Indexer 前向（两个 Compressor 相互独立 BoundaryExchange ）
 ```python
  def indexer_forward_with_cp(
       indexer,             # Indexer 实例
@@ -657,7 +661,7 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
       # weights:   [B, chunk, n_heads]（本地）
 ```
 
-#### 3.3.2.6 all-gather （复用 c128）
+#### 3.3.2.5 all-gather （复用 c128）
 ```python
   # 两路 AllGather，反向自动 ReduceScatter
   global_kv_compress = AllGatherCompressedKV.apply(local_kv_compress, cp_group)
@@ -667,7 +671,7 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
   # [B, seq_len//4, index_head_dim]
 ```
 
-#### 3.3.2.7 LiCompute CP 修正
+#### 3.3.2.6 LiCompute CP 修正
 ```python
   def li_compute_with_cp(
       li_compute,          # LiCompute 实例
@@ -708,7 +712,7 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
       return compress_topk_idxs, index_score
 ```
 
-#### 3.3.2.8 完整的 c4a attention 前向（含窗口 KV 边界通信）
+#### 3.3.2.7 完整的 c4a attention 前向（含窗口 KV 边界通信）
 > [!IMPORTANT] C4A 的 Window KV 也需要边界通信
 > C4A 层的 `SparseAttention` 同样调用 `GetWindowTopkIdxs`（`model.py:518`），
 > 存在与 ratio=1 层完全相同的跨 rank 窗口依赖问题。
