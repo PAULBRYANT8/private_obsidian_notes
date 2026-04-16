@@ -489,6 +489,91 @@ Indexer 检索：
 
 这种设计的核心权衡是：**先均匀压缩（S → S/4），再用低维 k_indexer 快速定位最相关的位置，最后只对 top-k 个位置用高维 kv_compressor 做精确计算**，把选择代价从 O(S × 512) 压缩到 O(S/4 × 128)。
 ### 3.3.2 C4A CP 方案设计
+
+#### 3.3.2.0 整体执行流程
+
+```
+输入：x [B, chunk, D]（rank r 持有全局序列中的第 r 段）
+│
+├─────────────────────────────────────────┐
+▼                                         ▼
+【Q 投影】（纯本地，无通信）           【Window KV 投影】（纯本地，无通信）
+wq_a → q_lora_rank                         wkv → kv [B, chunk, head_dim]
+wq_b → q [B, chunk, n_heads, head_dim]     kv_norm + RoPE（使用全局位置坐标）
+RoPE（使用全局位置坐标）                     │
+│                                         ▼
+│                                 【Window KV 边界 P2P 通信】
+│                                 rank r-1 将末尾 128 token 发给 rank r
+│                                 rank 0 无前驱，boundary 填全 0
+│                              kv_full = cat([boundary_kv, kv]) ← rank r>0
+│                                 kv_full = kv ← rank 0
+│                                 【cp_window_topk_idxs 修正】
+│                               boundary 拼入后索引空间扩大，需重新生成窗口索引
+│
+├─────────────────────────────────────────┐
+▼                                    （q 继续向下传递）
+【Indexer 前向（with CP，不传梯度）】
+│
+├──【内部 Compressor（head_dim=128）】
+│   wkv + wgate → 线性投影
+│   BoundaryExchange(kv, init=0) + BoundaryExchange(score, init=-inf)
+│   手动 overlap_transform：group 0 的 overlap 槽填入跨 rank 边界数据
+│   加权求和压缩 + RoPE(全局位置) → k_indexer_local [B, chunk//4, 128]
+│
+└──【q_indexer + weights（纯本地）】
+    wq_b → q_indexer [B, chunk, n_heads, 128]（使用全局位置 RoPE）
+    weights_proj → weights [B, chunk, n_heads]
+│
+▼
+【AllGather k_indexer】
+将各 rank 的 k_indexer_local 拼接，所有 rank 得到完整压缩序列的检索 key
+global_k_indexer [B, seq_len//4, 128]
+│
+▼
+【LiCompute（全局坐标修正）】
+q_indexer × global_k_indexer → index_score [B, chunk, seq_len//4]
+用 rank r 的全局 query 位置生成因果掩码（屏蔽未来 token）
+top-k 选择 → compress_topk_idxs（以 kv_full 长度为 offset 的全局索引）
+│
+▼
+【主 Compressor 前向（with CP，head_dim=512）】
+wkv + wgate → kv/score [B, chunk, 2*head_dim]
+│
+├── BoundaryExchange(kv_last, init=0.0 ) → recv_kv [B, 1, 4, d]
+└── BoundaryExchange(score_last, init=-inf) → recv_score [B, 1, 4, d]
+    （两次分开：rank 0 的初始值不同，kv=0 / score=-inf）
+│
+手动 overlap_transform（带 CP 修正）：
+    group 0 的 overlap 槽 ← recv_kv / recv_score（跨 rank 边界数据）
+    group 1..N-1 的 overlap 槽 ← 本 rank 前一个 group（纯本地 shift）
+加权求和压缩 (kv * softmax(score)).sum() + RoPE(全局位置)
+→ local_kv_compress [B, chunk//4, 512]
+│
+▼
+【AllGather kv_compress】
+将各 rank 的 local_kv_compress 拼接，所有 rank 得到完整压缩 KV
+global_kv_compress [B, seq_len//4, 512]
+│
+▼
+【因果裁剪】
+只保留 rank 0..r 的数据，去掉未来 rank 的压缩 token（满足因果注意力）
+causal_kv_compress [B, (cp_rank+1)*chunk//4, 512]
+│
+▼
+【SparseAttention】（q 来自最顶部的 Q 投影）
+├── Window Attention：q × kv_full（本地 chunk + 来自 rank r-1 的 128 个边界 token）
+│ 使用修正后的 cp_window_topk_idxs 确定每个 query 访问哪些 kv 位置
+└── Compress Attention：q × causal_kv_compress 中 compress_topk_idxs 指定的 top-k 行
+
+两路结果合并 → o [B, chunk, n_heads, head_dim]
+│
+▼
+
+输出：o [B, chunk, head_dim]
+
+（同时输出 LiLoss 作为 Indexer 的辅助训练损失）
+
+```
 #### 3.3.2.1 问题定位
 
   C4A compressor 使用 overlap=True，其 overlap_transform 使第 i 个压缩 token 依赖第 i-1 个 group 的数据：
