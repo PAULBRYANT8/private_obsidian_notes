@@ -128,8 +128,7 @@ def validate_cp_alignment(seq_len: int, cp_size: int) -> None:
   的思路，参数量更少。之后施加 RoPE 把位置信息编码进去。
   KV 投影：x → wkv，一次矩阵乘法把 x 投影成 KV（在 Window Attention 和 C128A 里 K 和 V 共享同一个投影，即 MLA 的压缩 KV 设计）。之后同样施加 RoPE 把位置信息编码进去。
 
-
-> [!NOTE] ratio=1 和 发送 1 个 token 的区别
+> [!IMPORTANT] ratio=1 和 发送 1 个 token 的区别
 > ratio=1 表示没有压缩，每个 token 的 KV 就是它本身，不会被合并成更少的 token。
 > Window Attention 的计算需求：Window Attention 中，每个 query 可以向左看 window_size=128 个原始 token；query 在全局位置 i -> 需要 KV 的位置来自 [i - 127, i]；
 
@@ -297,8 +296,8 @@ def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
   ┌────────────────────────────────────────┐
   │ kv_full = window_kv (含 P2P 边界修正)                                                │
   │ kv_states = cat([kv_full, causal_kv_compress], dim=1)                    │
-  │                                                                                                                          │
-  │  SparseAttention(q, kv_full, attn_sink, causal_kv_compress,         │
+  │                                                                                                                            │
+  │  SparseAttention(q, kv_full, attn_sink, causal_kv_compress,        │
   │                                  compress_topk_idxs)                                                 │
   │ （compress_topk_idxs 需用全局坐标，见 3.2.4）                             │
   └────────────────────────────────────────┘

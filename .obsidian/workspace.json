@@ -89,7 +89,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 224.5
   },
   "right": {
     "id": "2447bc8a766df1dd",
@@ -197,10 +197,10 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
-    "llm/deepseek/补充知识.md",
-    "llm/deepseek/cp.md",
     "Pasted image 20260416145328.png",
     "Pasted image 20260416111452.png",
+    "llm/deepseek/cp.md",
+    "llm/deepseek/补充知识.md",
     "执行命令/ubuntu/清理垃圾的命令.md",
     "执行命令/ubuntu",
     "未命名",
