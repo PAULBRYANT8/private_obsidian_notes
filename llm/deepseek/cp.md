@@ -160,6 +160,10 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
 > [!IMPORTANT] 不能沿用原 GetWindowTopkIdxs 生成的索引
 > 原 `GetWindowTopkIdxs` 生成的索引基于本地坐标 `0..chunk-1`，拼接边界 token 后
 > local_kv 整体偏移到了位置 128，原有索引无法访问边界 token，**必须重新计算**。
+> 换成更简单的理解：由于cp切分，rank r 需要接收 rank r-1 后128 个 token，从而组成新的 kv 矩阵，新矩阵不仅大小发生了改变，每个位置的语义也发生了改变。
+
+
+![[Pasted image 20260416111452.png]]
 
 **rank 0**（无前驱）：
 - `kv_full = local_kv`，形状 `[B, chunk, head_dim]`
@@ -203,32 +207,6 @@ def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
 ---
 
 ## 3.2 C128A CP 切分完整设计方案
-### 3.2.1 设计前提与约束
-
-  对齐约束（必要条件）
-	chunk_size = seq_len / cp_size
-  有效压缩要求：chunk_size % 128 == 0
-  等价于：      seq_len % (cp_size * 128) == 0                                                                                                            
-  验证：                                                     
-    seq_len=65536, cp=8  → chunk=8192,  8192%128=0  ✓ 
-    seq_len=4096,  cp=4  → chunk=1024,  1024%128=0  ✓ 
-    seq_len=4096,  cp=32 → chunk=128,   128%128=0   ✓    
-    seq_len=4096,  cp=64 → chunk=64,    64%128=64   ✗ → NotImplementedError
-  常见训练序列（4096 的整数倍）在常用 CP degree（≤32）下均自然满足，约束实际不会触发。
-
-  约束 S % (CP * 128) == 0，不满足直接 raise（在模型初始化时调用一次即可）。
-  
-**尾部截断逻辑在 CP 路径下是死代码，无需保留**：
-对齐约束确立后，推论链如下：
-	seq_len % (cp_size * 128) == 0
-		→ chunk = seq_len / cp_size，则 chunk % 128 == 0
-		→ chunk % 4 == 0（128 可被 4 整除，隐含此结论）
-		→ compressor 内部的 cutoff = (chunk // ratio) * ratio == chunk，remainder = 0
-		→ `if remainder > 0` 分支永远不触发
-
-因此 CP 专用的 forward 函数（`compressor_forward_with_cp` 等）中
-不应保留截断逻辑；原始 `Compressor.forward()`（非 CP 路径）仍需保留，
-因为非 CP 场景没有对齐保证。
 
 ### 3.2.2 数据流设计
 
