@@ -84,56 +84,32 @@ DataLoader 每次吐出的 inputs 和 labels 的形状是 `[batch, full_seq_len]
 
 # 三、RoPE（Rotaty Position Embedding，旋转位置编码）详解
 
-RoPE（Rotary Position Embedding，旋转位置编码）详解
-
-  ---
-  一、为什么需要位置编码？
-
-  Transformer 的 self-attention 本质上是一个集合操作（set operation）：
-
-  Attention(Q, K, V) = softmax(QK^T / √d) · V
-
-  对于序列 [token_0, token_1, token_2, ...]，如果把所有 token 打乱顺序，attention 的输出完全不变（因为 QK^T 的每个元素都只是两个向量的点积，与位置无关）。
-
+## 1、为什么需要位置编码？
+  Transformer 的 self-attention 本质上是一个集合操作（set operation）：Attention(Q, K, V) = softmax(QK^T / √d) · V
+  对于序列 `[token_0, token_1, token_2, ...]`，如果把所有 token 打乱顺序，attention 的输出完全不变（因为 QK^T 的每个元素都只是两个向量的点积，与位置无关）。
   但语言显然是有顺序的，"狗咬人" 和 "人咬狗" 意思完全不同。所以必须想办法把位置信息注入模型。
-
-  ---
-  二、早期方案的问题
-
-  绝对位置编码（BERT/GPT-1/2 做法）
-
-  在 token embedding 上直接加一个位置 embedding：
-
-  input = token_embedding(x) + position_embedding(pos)
-
+  
+## 2、早期方案的问题
+- 绝对位置编码（BERT/GPT-1/2 做法）
+  在 token embedding 上直接加一个位置 embedding：`input = token_embedding(x) + position_embedding(pos)`
   问题：
-  - 最大序列长度固定（position_embedding 是查找表，训练时最多 512 个位置）
-  - 两个 token 的距离信息被编码在绝对位置里，不直观（位置 3 和位置 5 的"相对距离 2"需要模型自己学）
+    - 最大序列长度固定（`position_embedding` 是查找表，训练时最多 512 个位置）
+    - 两个 token 的距离信息被编码在绝对位置里，不直观（位置 3 和位置 5 的"相对距离 2"需要模型自己学）
 
-  相对位置编码（T5、Shaw et al.）
-
-  在计算 attention score 时，加入相对距离的偏置：
-
-  score(q_i, k_j) = q_i · k_j + b(i-j)
-
+- 相对位置编码（T5、Shaw et al.）
+  在计算 attention score 时，加入相对距离的偏置：`score(q_i, k_j) = q_i · k_j + b(i-j)`
   问题：
-  - 需要修改 attention 内部结构
-  - 引入大量额外参数 b(·)
-  - 难以外推到训练时没见过的序列长度
+    - 需要修改 attention 内部结构
+    - 引入大量额外参数 b(·)
+    - 难以外推到训练时没见过的序列长度
 
-  ---
-  三、RoPE 的核心思想
+<mark style="background:#ff4d4f">上面两种方法都不能很好的解决在 llm 中 token 之间的位置问题</mark>。
 
-  RoPE 的目标是找到一种位置编码函数 f(x, pos)，满足：
-
-  ▎ 两个 token 的内积，只依赖它们各自的内容和相对距离，与绝对位置无关。
-
+# 3、RoPE 的核心思想
+  RoPE 的目标是找到一种位置编码函数 `f(x, pos)`，满足：<mark style="background:#d3f8b6">两个 token 的内积，只依赖它们各自的内容和相对距离，与绝对位置无关</mark>。
   数学上要求：
-
   $$\langle f(q, m),\ f(k, n) \rangle = g(q, k, m-n)$$
-
   即 q 在位置 m、k 在位置 n 的内积，只是 m-n（相对距离）的函数。
-
   RoPE 的解决方案：用旋转矩阵编码位置。
 
   ---
