@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/cp.md",
+                "file": "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "cp"
+              "title": "torchtitan v021 -> v022 cp切分的版本升级"
             }
           }
         ],
@@ -124,12 +124,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "llm/deepseek/cp.md",
+                "file": "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "cp 的出链列表"
+              "title": "torchtitan v021 -> v022 cp切分的版本升级 的出链列表"
             }
           },
           {
@@ -208,9 +208,11 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
+    "llm/deepseek/cp.md",
+    "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
+    "llm/说明",
     "Pasted image 20260416145328.png",
     "Pasted image 20260416111452.png",
-    "llm/deepseek/cp.md",
     "llm/deepseek/补充知识.md",
     "执行命令/ubuntu/清理垃圾的命令.md",
     "执行命令/ubuntu",
