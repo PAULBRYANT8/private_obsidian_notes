@@ -82,7 +82,178 @@ DataLoader 每次吐出的 inputs 和 labels 的形状是 `[batch, full_seq_len]
 	- 优点：显存低（每轮只持有一份 KV），但通信次数多  
 
 
-# 三、RoPE（Rotaty Position Embedding，旋转位置编码）相接
+# 三、RoPE（Rotaty Position Embedding，旋转位置编码）详解
+
+RoPE（Rotary Position Embedding，旋转位置编码）详解
+
+  ---
+  一、为什么需要位置编码？
+
+  Transformer 的 self-attention 本质上是一个集合操作（set operation）：
+
+  Attention(Q, K, V) = softmax(QK^T / √d) · V
+
+  对于序列 [token_0, token_1, token_2, ...]，如果把所有 token 打乱顺序，attention 的输出完全不变（因为 QK^T 的每个元素都只是两个向量的点积，与位置无关）。
+
+  但语言显然是有顺序的，"狗咬人" 和 "人咬狗" 意思完全不同。所以必须想办法把位置信息注入模型。
+
+  ---
+  二、早期方案的问题
+
+  绝对位置编码（BERT/GPT-1/2 做法）
+
+  在 token embedding 上直接加一个位置 embedding：
+
+  input = token_embedding(x) + position_embedding(pos)
+
+  问题：
+  - 最大序列长度固定（position_embedding 是查找表，训练时最多 512 个位置）
+  - 两个 token 的距离信息被编码在绝对位置里，不直观（位置 3 和位置 5 的"相对距离 2"需要模型自己学）
+
+  相对位置编码（T5、Shaw et al.）
+
+  在计算 attention score 时，加入相对距离的偏置：
+
+  score(q_i, k_j) = q_i · k_j + b(i-j)
+
+  问题：
+  - 需要修改 attention 内部结构
+  - 引入大量额外参数 b(·)
+  - 难以外推到训练时没见过的序列长度
+
+  ---
+  三、RoPE 的核心思想
+
+  RoPE 的目标是找到一种位置编码函数 f(x, pos)，满足：
+
+  ▎ 两个 token 的内积，只依赖它们各自的内容和相对距离，与绝对位置无关。
+
+  数学上要求：
+
+  $$\langle f(q, m),\ f(k, n) \rangle = g(q, k, m-n)$$
+
+  即 q 在位置 m、k 在位置 n 的内积，只是 m-n（相对距离）的函数。
+
+  RoPE 的解决方案：用旋转矩阵编码位置。
+
+  ---
+  四、二维情形：直觉理解
+
+  先看最简单的二维向量情形。
+
+  一个二维向量 q = [q_0, q_1]，在位置 m 处，将它旋转 m·θ 角度：
+
+  $$f(q, m) = \begin{bmatrix} \cos(m\theta) & -\sin(m\theta) \ \sin(m\theta) & \cos(m\theta) \end{bmatrix} \begin{bmatrix} q_0 \ q_1 \end{bmatrix}$$
+
+  两个旋转后向量的内积：
+
+  $$f(q, m)^T \cdot f(k, n) = q^T R_{-m\theta} R_{n\theta} k = q^T R_{(n-m)\theta} k$$
+
+  因为旋转矩阵满足 $R_\alpha^T R_\beta = R_{\beta-\alpha}$，内积结果只依赖 n-m（相对距离）。✓
+
+  ---
+  五、高维情形：实际实现
+
+  对于 d 维向量（d 必须是偶数），RoPE 把向量两两配对成 d/2 个二维子空间，每个子空间用不同频率的旋转：
+
+  $$f(q, m) = \begin{bmatrix} q_0 \ q_1 \ q_2 \ q_3 \ \vdots \ q_{d-2} \ q_{d-1} \end{bmatrix} \otimes \begin{bmatrix} \cos(m\theta_0) \ \cos(m\theta_0) \ \cos(m\theta_1) \ \cos(m\theta_1) \ \vdots
+  \ \cos(m\theta_{d/2-1}) \ \cos(m\theta_{d/2-1}) \end{bmatrix} + \begin{bmatrix} -q_1 \ q_0 \ -q_3 \ q_2 \ \vdots \ -q_{d-1} \ q_{d-2} \end{bmatrix} \otimes \begin{bmatrix} \sin(m\theta_0) \
+  \sin(m\theta_0) \ \sin(m\theta_1) \ \sin(m\theta_1) \ \vdots \ \sin(m\theta_{d/2-1}) \ \sin(m\theta_{d/2-1}) \end{bmatrix}$$
+
+  其中频率按照以下公式设定（继承自 Transformer 原始论文的 sinusoidal encoding）：
+
+  $$\theta_i = \frac{1}{10000^{2i/d}}, \quad i = 0, 1, \ldots, \frac{d}{2}-1$$
+
+  - i=0：旋转最快，每个位置转约 1 弧度，编码近距离关系
+  - i=d/2-1：旋转极慢（1/10000 弧度/位置），编码远距离关系
+
+  可以想象成时钟的指针：秒针（高频）转得快，时针（低频）转得慢，组合起来唯一标识时间。
+
+  ---
+  六、复数表示（实际代码使用的形式）
+
+  用复数可以更紧凑地表达旋转。把相邻两维配对成复数：
+
+  $$q_{\text{complex}} = q_0 + i \cdot q_1, \quad q_2 + i \cdot q_3, \ldots$$
+
+  旋转位置 m 就是乘以单位复数 $e^{im\theta_k}$：
+
+  $$f(q_{\text{complex}}, m)k = (q{2k} + i \cdot q_{2k+1}) \cdot e^{im\theta_k}$$
+
+  torchtitan 中 freqs_cis 就是预计算好的这些复数旋转因子：
+
+  # torchtitan/models/llama3/model/model.py
+  def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+      # 计算频率：θ_i = 1 / 10000^(2i/d)
+      freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+      # 计算位置 × 频率
+      t = torch.arange(end)          # [0, 1, 2, ..., max_seq_len-1]
+      freqs = torch.outer(t, freqs)  # shape: [max_seq_len, dim//2]
+      # 转换为复数 e^(i*m*θ)
+      freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # 模为1，辐角为 m*θ
+      return freqs_cis               # shape: [max_seq_len, dim//2], dtype: complex64
+
+  应用 RoPE 时：
+
+  def apply_rotary_emb(xq, xk, freqs_cis):
+      # 把 query/key 的最后两维视为复数
+      xq_complex = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
+      xk_complex = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
+      # 乘以旋转因子（广播到 batch 和 head 维度）
+      freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)  # [1, seq, 1, dim//2]
+      xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(-2)
+      xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(-2)
+      return xq_out, xk_out
+
+  ---
+  七、RoPE 的优势
+
+  ┌─────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐
+  │          特性           │                                         说明                                         │
+  ├─────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ 相对位置天然涌现        │ 内积 $\langle f(q,m), f(k,n) \rangle$ 只依赖 $m-n$，无需额外设计                     │
+  ├─────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ 无额外参数              │ freqs_cis 是固定的，不需要训练，不增加模型参数量                                     │
+  ├─────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ 长度外推性              │ 可以在测试时直接用比训练时更大的位置索引（有一定限制，后续被 YaRN 等方法进一步改进） │
+  ├─────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ 与 Flash Attention 兼容 │ 在 QK 矩阵乘法之前就完成了位置编码，不改变 attention 内部计算                        │
+  ├─────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤
+  │ 计算效率高              │ 只是逐元素乘法，几乎没有额外计算开销                                                 │
+  └─────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  八、与 CP 切分的关系（回到前面的问题）
+
+  现在可以理解为什么 v0.2.1 需要切分 freqs_cis 了：
+
+  完整序列：[token_0, token_1, ..., token_S-1]
+  对应位置：[pos_0,   pos_1,   ..., pos_S-1  ]
+
+  freqs_cis[pos_i] = e^(i·pos_i·θ)  ← 位置 pos_i 的旋转因子
+
+  CP 切分后，rank 1 持有 token[S/N : 2S/N]，这些 token 对应的是位置 S/N 到 2S/N-1。如果 freqs_cis 不切分，rank 1 拿到的是 freqs_cis[0:S/N]，即位置 0 到 S/N-1 的旋转因子，对应关系完全错误：
+
+  错误情况（v0.2.1 不切分 freqs_cis 时）：
+  rank 1 的 token:  [token_512, token_513, ..., token_1023]  ← 真实位置 512~1023
+  rank 1 的 RoPE:   freqs_cis[0:512]                         ← 位置 0~511 的旋转因子
+  结果：token_512 被编码成了 position 0，位置编码完全错误！
+
+  正确情况（切分后）：
+  rank 1 的 RoPE:   freqs_cis[512:1024]                      ← 位置 512~1023 的旋转因子
+
+  而 v0.2.2 的解决方案更优雅：切分 positions 索引而不是 freqs_cis 本身，让模型内部用 freqs_cis[positions] 按需索引，freqs_cis 始终保持完整，不需要特殊处理。
+
+  ---
+  九、参考论文
+
+  ▎ RoFormer: Enhanced Transformer with Rotary Position Embedding
+  ▎ Su et al., 2021
+  ▎ https://arxiv.org/abs/2104.09864
+
+  这篇是 RoPE 的原始论文，作者苏剑林（苏神）。文章推导严谨，从"什么是好的相对位置编码"出发，一步步推导出旋转的形式，值得精读。
+
+
 
 
 
