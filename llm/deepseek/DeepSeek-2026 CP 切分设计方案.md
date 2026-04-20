@@ -975,3 +975,93 @@ def c4a_attention_forward_with_cp(
         index_score, q_indexer, global_k_indexer, weights,
     )
 ```
+
+
+ ---
+
+# 五、调试记录
+
+## 5.1 错误一：`positions` 意外关键字参数
+
+### 现象
+
+首次运行 CP 训练，第一个 step 立即崩溃：
+
+```
+TypeError: DeepSeekV4Model.forward() got an unexpected keyword argument 'positions'
+```
+
+### 根因分析
+
+torchtitan 的 `prepare_context_parallel_input` 函数在做序列切分时，会同步创建一个 `positions` 张量（全局位置索引），并将其写入 `extra_kwargs`，最终通过 `model(inputs, **extra_kwargs)` 传入模型：
+
+```python
+# torchtitan/distributed/context_parallel.py
+positions = torch.arange(0, inputs.shape[1], ...).expand(inputs.shape)
+(inputs, labels, positions), _ = cp_shard(cp_mesh, (inputs, labels, positions), ...)
+extra_kwargs["positions"] = positions   # ← 写入 extra_kwargs
+```
+
+本项目还有 `mtp_context_parallel.py` 补丁，当 `num_mtp_modules=0` 时会直接调用原版 `prepare_context_parallel_input`，同样会产生 `positions`。
+
+`DeepSeekV4Model.forward()` 原始签名只有 `(tokens, input_ids, attention_masks)`，不接受 `positions`，因此报错。
+
+> **注意**：`positions` 对 DeepSeek-V4 CP 没有实际用途。我们的 CP patch 通过 `global_start = cp_rank * chunk` 自行推算每个 rank 的 freqs_cis 偏移，不依赖外部传入的 `positions`。
+
+### 修复
+
+在 `DeepSeekV4Model.forward()` 签名中增加 `positions=None`，接受但忽略（`torchtitan_npu/models/deepseek_v4/model/model.py`）。
+
+---
+
+## 5.2 错误二：`sdpa_to_sfa_adapter` 不接受 `window_topk_idxs`
+
+### 现象
+
+修复错误一后，第一个 step 再次崩溃：
+
+```
+TypeError: sdpa_to_sfa_adapter() got an unexpected keyword argument 'window_topk_idxs'
+```
+
+调用栈：
+```
+deepseek_v4_cp.py, _c1a_forward_with_cp
+    o = inner_attn.sparse_attn(q, kv_full, inner_attn.attn_sink,
+                               window_topk_idxs=window_topk)
+→ sdpa_to_sfa_adapter() got an unexpected keyword argument 'window_topk_idxs'
+```
+
+### 根因分析
+
+**执行顺序**：模型构建时，`deepseek_v4_sfa` converter 先于 CP patch 运行，将 `SparseAttention.forward` 替换为 `sdpa_to_sfa_adapter`：
+
+```
+[SparseAttention forward] Applied 1 replacement(s)   ← SFA converter，先
+[DeepSeek-V4 CP] Patched Attention.forward.          ← CP patch，后
+```
+
+`sdpa_to_sfa_adapter` 原始签名无 `window_topk_idxs` 参数，`kv_compress`/`compress_topk_idxs` 也无默认值。CP 的 `_c1a_forward_with_cp` 以关键字方式传入 `window_topk_idxs`，Python 在绑定关键字参数阶段遇到未知名称立即抛出 `TypeError`。
+
+**SFA kernel 不支持显式 ori 稀疏索引**：查阅 mindspeed 源码，`SparseAttnSharedKV` 的 metadata 调用中有明确注释 `oriTopk not support now`，即使传入 `ori_sparse_indices` 也会被 kernel 忽略，始终使用 band 模式。
+
+**Band 模式在 CP rank r>0 下结果错误**：band 模式规则为 `query qi → kv[qi−127 .. qi]`，而 rank r>0 的 kv_full 布局为 `[boundary_128 | local_chunk]`，正确的 window 范围是 `kv_full[qi+1 .. qi+128]`，两者完全不同，无法通过调整参数修正。
+
+### 修复
+
+**核心思路**：SFA converter 只替换 `SparseAttention.forward`，不替换类的其他属性。在 `SparseAttention` 类定义末尾预存原始 SDPA 实现为 `_original_forward`，此属性在 converter 运行前已绑定，之后永久可用。
+
+修改 `sdpa_to_sfa_adapter`：有 `window_topk_idxs`（CP rank r>0）时调用 `_original_forward` 走 SDPA；无 `window_topk_idxs`（rank 0 或非 CP）时走 SFA kernel（band 模式正确）。
+
+```
+rank 0 / 非CP:  sparse_attn(..., window_topk_idxs=None)
+                → sdpa_to_sfa_adapter → SFA kernel (band mode) ✅
+
+rank r>0:       sparse_attn(..., window_topk_idxs=shifted_indices)
+                → sdpa_to_sfa_adapter → SparseAttention._original_forward (SDPA) ✅
+```
+
+涉及文件：
+- `torchtitan_npu/models/deepseek_v4/model/model.py`：`SparseAttention` 末尾加 `_original_forward = forward`
+- `torchtitan_npu/converters/kernels/deepseek_v4_sfa.py`：`sdpa_to_sfa_adapter` 新增 `window_topk_idxs=None` 参数及回调逻辑
+- `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：rank 0 传 `window_topk_idxs=None`，rank r>0 传显式移位索引
