@@ -213,39 +213,31 @@ $$\langle f(q, m), f(k, n) \rangle = \text{Re}(q k^* e^{i(m-n)\theta})$$
 
 
 
-二、v0.2.2 的 CP 切分方案：基于 DTensor 的显式切分 + 负载均衡
+# 四、v0.2.2 的 CP 切分方案：基于 DTensor 的显式切分 + 负载均衡
 
-  核心机制
+ 核心机制：v0.2.2 完全重构，使用 PyTorch 新的 `_ContextParallel DTensor` 并行化方案，在 数据加载后显式切分，并引入两种 `Load Balancer` 解决负载不均衡。
 
-  v0.2.2 完全重构，使用 PyTorch 新的 _ContextParallel DTensor 并行化方案，在 数据加载后显式切分，并引入两种 Load Balancer 解决负载不均衡。
+## 4.1  SDPA 路径：HeadTail Load Balancer
 
-  2.1 SDPA 路径：HeadTail Load Balancer
+HeadTail 切分策略（`_HeadTailLoadBalancer`）：对于 CP degree = N，不再做连续分块，而是将序列的头部和尾部交错配对分配给同一个 rank：
+	序列 = [0, 1, 2, 3, 4, 5, 6, 7]，CP degree = 4
+		rank 0: token [0, 7]   ← 第1个 + 最后1个
+		rank 1: token [1, 6]   ← 第2个 + 倒数第2个
+		rank 2: token [2, 5]
+		rank 3: token [3, 4]
+对于 causal attention，越靠前的 token 计算量越少，越靠后的越多。头尾配对后，每个 rank 的计算量大致均衡（一轻一重相加）。
 
-  HeadTail 切分策略（_HeadTailLoadBalancer）：
+## 4.2 FlexAttention 路径：PTRR Load Balancer
 
-  对于 CP degree = N，不再做连续分块，而是将序列的头部和尾部交错配对分配给同一个 rank：
+v0.2.2 同时增加对 FlexAttention 的 CP 支持，使用 `_PTRRLoadBalancer`（PTRR = Prefix-aware Token Reordering and Redistribution）。
+PTRR 根据 BlockMask 的实际 attention pattern 来动态计算每个 token 的计算量，然后做负载均衡的分配，而不是依赖 causal 模式的先验假设。这使得它能正确处理各种复杂的 mask 模式（文档分块、prefix sharing等）。
 
-  序列 = [0, 1, 2, 3, 4, 5, 6, 7]，CP degree = 4
-
-  rank 0: token [0, 7]   ← 第1个 + 最后1个
-  rank 1: token [1, 6]   ← 第2个 + 倒数第2个
-  rank 2: token [2, 5]
-  rank 3: token [3, 4]
-
-  对于 causal attention，越靠前的 token 计算量越少，越靠后的越多。头尾配对后，每个 rank 的计算量大致均衡（一轻一重相加）。
-
-  2.2 FlexAttention 路径：PTRR Load Balancer
-
-  v0.2.2 同时新增对 FlexAttention 的 CP 支持，使用 _PTRRLoadBalancer（PTRR = Prefix-aware Token Reordering and Redistribution）。
-
-  PTRR 根据 BlockMask 的实际 attention pattern 来动态计算每个 token 的计算量，然后做负载均衡的分配，而不是依赖 causal 模式的先验假设。这使得它能正确处理各种复杂的 mask 模式（文档分块、prefix sharing
-   等）。
-
-  2.3 代码路径重构
+## 4.3 代码路径重构
 
   新的切分入口（context_parallel.py，train.py）：
 
   # v0.2.2 —— 在数据加载后显式切分，freqs_cis 不再需要切分
+```python
   def prepare_context_parallel_input(inputs, labels, extra_kwargs,
                                       cp_mesh, device,
                                       load_balancer_type="headtail"):
@@ -258,6 +250,7 @@ $$\langle f(q, m), f(k, n) \rangle = \text{Re}(q k^* e^{i(m-n)\theta})$$
       )
       extra_kwargs["positions"] = positions   # ← positions 传给模型做 RoPE
       return inputs, labels, extra_kwargs
+```
 
   # train.py 中，无需 context manager，直接切好数据即可
   if parallel_dims.cp_enabled:
@@ -311,7 +304,7 @@ $$\langle f(q, m), f(k, n) \rangle = \text{Re}(q k^* e^{i(m-n)\theta})$$
   ---
   四、修改带来的好处
 
-  1. 解决 Causal Attention 的负载不均衡
+  3. 解决 Causal Attention 的负载不均衡
 
   这是最核心的改进。原有均匀切分下：
 
@@ -320,16 +313,16 @@ $$\langle f(q, m), f(k, n) \rangle = \text{Re}(q k^* e^{i(m-n)\theta})$$
 
   HeadTail 配对后每个 rank 的计算量近似相等，GPU 利用率和训练吞吐显著提升（尤其是大 CP degree 时效果更明显）。
 
-  2. 解锁 FlexAttention + CP
+  4. 解锁 FlexAttention + CP
 
   通过 PTRR 负载均衡器，v0.2.2 第一次支持了 FlexAttention 与 CP 的组合，这对于需要自定义 attention mask（文档注意力、因果分块、prefix caching 等场景）非常重要。
 
-  3. 消除 freqs_cis 切分的复杂性
+  5. 消除 freqs_cis 切分的复杂性
 
   v0.2.1 中必须将模型内部的 RoPE 缓存 freqs_cis 作为 buffer 传入切分，在 PP（Pipeline Parallel）下每个 stage 都要单独处理，逻辑复杂且易出错。v0.2.2 改为切分 positions 索引，模型内部通过
   freqs_cis[positions] 的方式索引取值，完全解耦了 RoPE 与 CP 的交互。
 
-  4. API 更清晰、可组合性更好
+  6. API 更清晰、可组合性更好
 
   从 context manager 式的隐式黑盒，变成显式的 parallelize_module + DTensor 并行计划，与 TP/FSDP 的组合方式完全一致，更容易理解和扩展。
 

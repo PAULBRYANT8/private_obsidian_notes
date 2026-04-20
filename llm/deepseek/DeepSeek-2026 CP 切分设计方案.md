@@ -166,10 +166,11 @@ class BoundaryExchange(torch.autograd.Function):
 		
 		reqs = []
 		
+		# 使用 group_dst/group_src（组内 local rank），避免多维 mesh 下全局 rank 映射错误
 		if rank < cp_size - 1:
-			reqs.append(dist.isend(send_tensor.contiguous(), dst=rank+1, group=group))
+			reqs.append(dist.isend(send_tensor.contiguous(), group=group, group_dst=rank+1))
 		if rank > 0:
-			reqs.append(dist.irecv(recv_buf, src=rank-1, group=group))
+			reqs.append(dist.irecv(recv_buf, group=group, group_src=rank-1))
 		for req in reqs: req.wait()
 		return recv_buf
 		
@@ -178,9 +179,9 @@ class BoundaryExchange(torch.autograd.Function):
 		grad_send = torch.zeros_like(grad_recv)
 		reqs = []
 		if ctx.rank > 0:
-			reqs.append(dist.isend(grad_recv.contiguous(), dst=ctx.rank-1, group=ctx.group))
+			reqs.append(dist.isend(grad_recv.contiguous(), group=ctx.group, group_dst=ctx.rank-1))
 		if ctx.rank < ctx.cp_size - 1:
-			reqs.append(dist.irecv(grad_send, src=ctx.rank+1, group=ctx.group))
+			reqs.append(dist.irecv(grad_send, group=ctx.group, group_src=ctx.rank+1))
 			
 		for req in reqs: req.wait()
 		return grad_send, None, None, None, None  # init_value 无梯度
@@ -740,6 +741,7 @@ def indexer_forward_with_cp(
     indexer,             # Indexer 实例
     x, qr,              # x: [B,chunk,D]，qr: [B,chunk,q_lora_rank]
     freqs_cis_global,
+    hadamard_mat,        # 模型级别的 hadamard_mat（self.hadamard_mat），传给 rotate_activation
     cp_rank, cp_size, cp_group,
     chunk_size, ratio=4,
 ):
@@ -750,7 +752,7 @@ def indexer_forward_with_cp(
         indexer.compressor, x, freqs_cis_global,
         cp_rank, cp_size, cp_group, chunk_size, ratio,
     )  # [B, chunk//4, index_head_dim]
-    k_indexer = rotate_activation(k_indexer)  # Hadamard 旋转
+    k_indexer = rotate_activation(k_indexer, hadamard_mat)  # Hadamard 旋转
 
     # ── 下半部分：q_indexer 和 weights（纯本地，不需要通信）────────────
     rd = indexer.rope_head_dim
@@ -762,7 +764,7 @@ def indexer_forward_with_cp(
     freqs_local = freqs_cis_global[global_start : global_start + chunk]
     q_rope = apply_rotary_emb(q_rope, freqs_local)
     q_indexer = torch.cat([q_nope, q_rope], dim=-1)
-    q_indexer = rotate_activation(q_indexer)
+    q_indexer = rotate_activation(q_indexer, hadamard_mat)
 
     weights = indexer.weights_proj(x) * (indexer.softmax_scale * indexer.n_heads ** -0.5)
 
@@ -884,6 +886,7 @@ def c4a_attention_forward_with_cp(
     inner_attn,           # InnerAttention 实例（含 attn_sink/sparse_attn/li_compute）
     x,                    # [B, chunk, D]
     freqs_cis_global,     # 全量 freqs_cis（compress_rope_theta），供 Q/KV/Compressor/Indexer 共用
+    hadamard_mat,         # 模型级别的 hadamard_mat（self.hadamard_mat），传给 rotate_activation
     attention_masks,
     cp_rank, cp_size, cp_group,
     chunk_size, seq_len,
@@ -927,6 +930,7 @@ def c4a_attention_forward_with_cp(
     with torch.no_grad():
         q_indexer, k_indexer_local, weights = indexer_forward_with_cp(
             pre_attn.indexer, x.detach(), qr.detach(), freqs_cis_global,
+            hadamard_mat,
             cp_rank, cp_size, cp_group, chunk_size, ratio,
         )
 
