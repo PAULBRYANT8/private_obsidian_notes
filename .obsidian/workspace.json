@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
+                "file": "llm/deepseek/cp.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "torchtitan v021 -> v022 cp切分的版本升级"
+              "title": "cp"
             }
           }
         ],
@@ -124,12 +124,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
+                "file": "llm/deepseek/cp.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "torchtitan v021 -> v022 cp切分的版本升级 的出链列表"
+              "title": "cp 的出链列表"
             }
           },
           {
@@ -208,6 +208,7 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
+    "Welcome.md",
     "llm/deepseek/cp.md",
     "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
     "llm/说明",
@@ -225,7 +226,6 @@
     "llm/deepseek",
     "llm",
     "每日知识总结.md",
-    "Welcome.md",
     "Untitled"
   ]
 }

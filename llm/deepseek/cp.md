@@ -27,6 +27,44 @@ if (
 
 
 ---
+
+## 零二、SparseAttention 必须增加 window_topk_idxs 参数
+
+CP 模式下三类层（ratio=1 / C128A / C4A）均需向 `SparseAttention` 传递外部计算的修正窗口索引。原 `SparseAttention.forward()`（`model.py:608`）始终调用 `get_window_topk_idxs(window_size, bsz, seqlen)` 生成本地坐标索引（seqlen = chunk）。对 rank r > 0，`kv_full = [boundary_kv(128) || local_kv(chunk)]` 大小为 128+chunk，但生成的索引范围 `0..chunk-1` 根本无法访问前 128 个边界 token，三类层的窗口 attention 计算均错误。
+
+各节计算的 `cp_window_topk_idxs` 是正确的，但只有在 `SparseAttention` 支持外部传入时才能生效。需修改 `model/model.py` 中 `SparseAttention.forward()`，增加可选参数 `window_topk_idxs=None`：
+
+```python
+def forward(
+	self,
+	query_states: torch.Tensor,
+	kv_states: torch.Tensor,
+	attn_sink: torch.Tensor,
+	kv_compress: torch.Tensor | None = None,
+	compress_topk_idxs: torch.Tensor | None = None,
+	window_topk_idxs: torch.Tensor | None = None, # 新增：CP 模式传入修正后的窗口索引
+	):
+		bsz, seqlen, _, _ = query_states.size()
+		
+		# CP 模式：使用外部传入的修正索引；非 CP 模式：按原逻辑生成（向后兼容）
+		if window_topk_idxs is not None:
+			topk_idxs = window_topk_idxs
+		else:
+			topk_idxs = self.get_window_topk_idxs(self.window_size, bsz, seqlen)
+			
+		if self.compress_ratio > 1:
+			offset = kv_states.size(1)
+			if compress_topk_idxs is None:
+				compress_topk_idxs = self.get_compress_topk_idxs(query_states, offset)
+			topk_idxs = torch.cat(
+				[topk_idxs.to(kv_states.device), compress_topk_idxs.to(kv_states.device)],
+				dim=-1,
+			)
+		# ... 其余逻辑不变
+```
+此修改向后兼容：非 CP 路径不传 `window_topk_idxs`，行为与原来完全相同。
+
+---
 # 一、问题本质分析
 
 DeepSeek-2026 的每个 Transformer Block 包含两大组件：**MHC（Multi-Head Hyper-Connections）** 和 **Attention**。
@@ -158,31 +196,17 @@ rank r:  [token_{r*chunk}, ...]   ←  Recv (128 tokens)
 
   - 通信原语：P2P Send/Recv（仅向前一个 rank 借 128 个 token）
   - 通信量：128 × head_dim × 2B = 128 × 512 × 2B ≈ 131KB（极小）
-- 采用 isend + irecv + wait() 的策略：
+- **使用 `BoundaryExchange`（§3.3.2.2）而非普通 isend/irecv 函数**：Window KV 的边界 token 参与 attention 计算后产生梯度，该梯度必须流回 rank r-1 的 `wkv` 参数。普通 `dist.isend/irecv` 不在 autograd 计算图中，梯度会被静默丢弃，导致训练参数无法正确更新。`BoundaryExchange`（§3.3.2.2）已封装好前向通信与反向梯度回传，直接复用，`init_value=0.0` 与非 CP 行为一致：
 ```python
-  def window_boundary_comm(boundary_tokens, recv_buf, rank, cp_size, group):
-      """                                                                   
-      boundary_tokens: (B, 128, head_dim)，当前 rank 最后 128 个 token
-      recv_buf:        (B, 128, head_dim)，预分配接收缓冲区                    
-      """
-
-      reqs = []  
-
-      # 向右邻居发送（非阻塞，立即挂起）
-      if rank < cp_size - 1:
-          reqs.append(dist.isend(boundary_tokens, dst=rank + 1, group=group)) 
-          
-      # 从左邻居接收（非阻塞，立即挂起）
-      if rank > 0:
-          reqs.append(dist.irecv(recv_buf, src=rank - 1, group=group))    
-
-      # ← 这里可以插入本地计算（计算通信 overlap）                                                                                                           
-      # 统一等待所有挂起请求
-      for req in reqs:
-          req.wait()
-      return recv_buf if rank > 0 else None
+# Window KV 边界交换：复用 BoundaryExchange（§3.3.2.2），含反向梯度，init_value=0.0
+boundary_kv = BoundaryExchange.apply(
+	kv[:, -window_size:, :].contiguous(), # [B, 128, head_dim]，发给 rank r+1
+	cp_rank, cp_size, cp_group, 0.0 # rank 0 的 recv_buf 初始化为全 0
+)
+# 所有 rank 均调用，BoundaryExchange 内部按 rank 判断是否真正收发：
+# rank r > 0：boundary_kv = [B, 128, head_dim]（来自 rank r-1 的最后 128 个 token）
+# rank 0： boundary_kv = 全 0 的缓冲区（无前驱，与非 CP 行为一致）
 ```
-采用这个策略不会造成死锁的原因：<mark style="background:#b1ffff">isend/irecv 只是向通信后端注册请求并立即返回，不阻塞</mark>。所有rank在 wait() 之前就已经同时把 send/recv 同时挂起了，后端在内存段完全匹配。
 
 ### 3.1.1 KV 拼接后 window_topk_idxs 必须修正
 
@@ -438,64 +462,79 @@ query i=511 全局位置 4096 → compress_pos < 4096//128=32 → 可用 [0..31]
 #### 3.2.5.3 C128A 前向主逻辑
 ```python
   def c128a_forward_with_cp(
-      x: torch.Tensor,              # [B, chunk, D]
-      compressor,                   # ratio=128 Compressor 实例
-      window_proj,                  # Window KV 投影
-      attn_sink,
-      sparse_attn,                  # SparseAttention 实例（ratio=128）
+	  x: torch.Tensor, # [B, chunk, D]
+	  pre_attn, # PreAttention 实例（含 wq_a/q_norm/wq_b/wkv/kv_norm/compressor_128）
+	  inner_attn, # InnerAttention 实例（含 attn_sink/sparse_attn）
       cp_rank: int,
       cp_size: int,
       cp_group: dist.ProcessGroup,
       seq_len: int,
+      freqs_cis_global: torch.Tensor, # 全量 freqs_cis（compress_rope_theta），[max_seq_len, rope_head_dim]
       window_size: int = 128,
   ) -> torch.Tensor:
       B, chunk, D = x.shape
       ratio = 128
-      
-      # ── 1. 本地 Window KV（纯本地投影）────────────────────────────────────
-      local_window_kv = window_proj(x) # [B, chunk, head_dim=512]
-      
-      # ── 2. Window KV 边界通信（复用 3.1 节 window_boundary_comm）──────────
-      recv_buf = torch.zeros_like(local_window_kv[:, :window_size, :])
-      boundary_kv = window_boundary_comm(
-	      local_window_kv[:, -window_size:, :], recv_buf, cp_rank, cp_size, cp_group
-	  ) # rank > 0 时为 [B, 128, head_dim]，rank 0 返回 None
-	  
+	  rd = pre_attn.rope_head_dim
+	  global_start = cp_rank * chunk
+	  freqs_local = freqs_cis_global[global_start : global_start + chunk]
+
+	  # ── 1. Q 投影（本地）────────────────────────────────────────────────
+	  qr = pre_attn.q_norm(pre_attn.wq_a(x))
+	  q = pre_attn.wq_b(qr).unflatten(-1, (pre_attn.n_heads, pre_attn.head_dim))
+	  q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + pre_attn.eps)
+	  q_nope, q_rope = torch.split(q, [pre_attn.head_dim - rd, rd], dim=-1)
+	  q_rope = apply_rotary_emb(q_rope, freqs_local)
+	  q = torch.cat([q_nope, q_rope], dim=-1) # [B, chunk, n_heads, head_dim]
+
+	  # ── 2. Window KV 投影（本地）──────────────────────────────────────────
+	  kv = pre_attn.kv_norm(pre_attn.wkv(x))
+	  kv_nope, kv_rope = torch.split(kv, [pre_attn.head_dim - rd, rd], dim=-1)
+	  kv_rope = apply_rotary_emb(kv_rope, freqs_local)
+	  local_window_kv = torch.cat([kv_nope, kv_rope], dim=-1) # [B, chunk, head_dim]
+
+	  # ── 3. Window KV 边界通信（BoundaryExchange §3.3.2.2，含反向梯度）──────
+	  # 不能用普通 isend/irecv：boundary_kv 参与 attention 计算产生的梯度必须流回 rank r-1
+	  boundary_kv = BoundaryExchange.apply(
+		  local_window_kv[:, -window_size:, :].contiguous(),
+		  cp_rank, cp_size, cp_group, 0.0 # init_value=0.0，rank 0 收到全 0
+	  )
 	  if cp_rank > 0:
 		  kv_full = torch.cat([boundary_kv, local_window_kv], dim=1) # [B, 128+chunk, D]
 	  else:
-	      kv_full = local_window_kv # [B, chunk, D]
-	      
-	  # ── 3. Window topk 索引（CP 修正）────────────────────────────────────
+		  kv_full = local_window_kv # [B, chunk, D]
+
+	  # ── 4. Window topk 索引（CP 修正）────────────────────────────────────
 	  window_topk = cp_window_topk_idxs(B, chunk, window_size, cp_rank)
 	  # [B, chunk, 128]
-	  
-	  # ── 4. 本地压缩（compressor 在本地 chunk 上独立运行)────────────────────
-	  local_kv_compress = compressor(x) # [B, chunk//128, head_dim]
-	  
-	  # ── 5. AllGather 压缩 KV（通信量 ~512KB，可忽略)───────────────────────
-	  global_kv_compress = allgather_kv_compress(local_kv_compress, group=cp_group)
+
+	  # ── 5. Compressor 压缩（overlap=False，无 BoundaryExchange，直接调用原始 forward）──
+	  # 传入 freqs_local，Compressor.forward() 内部会做 [:chunk:128] 切片，正确对应全局位置
+	  local_kv_compress = pre_attn.compressor_128(x, freqs_local) # [B, chunk//128, head_dim] 
+
+	  # ── 6. AllGather 压缩 KV（前向 AllGather，反向自动 ReduceScatter）──────
+	  global_kv_compress = AllGatherCompressedKV.apply(local_kv_compress, cp_group)
 	  # [B, seq_len//128, head_dim]
-	  
-	  # ── 6. 因果有效性裁剪──────────────────────────────────────────────────
+
+	  # ── 7. 因果有效性裁剪──────────────────────────────────────────────────
 	  valid_compress_len = (cp_rank + 1) * (chunk // ratio)
 	  causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]
-	  # rank 0: [B, chunk//128, D]；rank 7: [B, seq_len//128, D]
-	  
-	  # ── 7. compress_topk_idxs（全局坐标修正）──────────────────────────────
+	  # rank 0: [B, chunk//128, D]；rank cp_size-1: [B, seq_len//128, D]
+
+	  # ── 8. compress_topk_idxs（全局坐标修正）──────────────────────────────
 	  offset = kv_full.size(1) # rank 0: chunk；rank r>0: 128+chunk
 	  compress_topk = get_c128a_compress_topk_idxs_cp(
 		  B, chunk, ratio, cp_rank, valid_compress_len, offset
 	  )
 	  # [B, chunk, valid_compress_len]
-	  
-	  # ── 8. 合并 topk 索引并调用 SparseAttention ─────────────────────────
-	  q = query_proj(x) # [B, chunk, n_heads, head_dim]
-	  topk_idxs = torch.cat([window_topk, compress_topk], dim=-1).int()
-	  o = sparse_attn(q, kv_full, attn_sink, causal_kv_compress, compress_topk)
-	  # sparse_attn 内部会拼接 kv_full 和 causal_kv_compress
-	  
-	  return o     
+
+	  # ── 9. SparseAttention（传入修正后的 window_topk_idxs，跳过内部 GetWindowTopkIdxs）─
+	  # SparseAttention 需先按零二节修改，增加 window_topk_idxs 参数
+	  o = inner_attn.sparse_attn(
+		  q, kv_full, inner_attn.attn_sink, causal_kv_compress,
+		  compress_topk_idxs=compress_topk,
+		  window_topk_idxs=window_topk, # 外部修正的窗口索引，覆盖内部 get_window_topk_idxs
+	  )
+	  return o
 ```
   
 ---
@@ -872,72 +911,69 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 
 ```python
   def c4a_attention_forward_with_cp(
-      attn,               # Attention 实例（compress_ratio=4）
-      x,                  # [B, chunk, D]
-      freqs_cis_global,
+	  pre_attn,             # PreAttention 实例（pre_attention，含 wq_a/q_norm/wq_b/wkv/kv_norm/compressor/indexer）                                                           
+      inner_attn,           # InnerAttention 实例（inner_attention，含 attn_sink/sparse_attn/li_compute）                                                                      
+      x,                    # [B, chunk, D]                                                                                                                                    
+      freqs_cis_global,     # 全量 freqs_cis（compress_rope_theta），供 Q/KV/Compressor/Indexer 共用 
       attention_masks,
       cp_rank, cp_size, cp_group,
       chunk_size, seq_len,
       ratio=4,
-      window_size =128,
+      window_size=128,
   ):
       B, chunk, D = x.shape
-      rd = attn.rope_head_dim
-
-      # ── Q 投影（纯本地）────────────────────────────────────────────────
-      qr = attn.q_norm(attn.wq_a(x))
-      q  = attn.wq_b(qr).unflatten(-1, (attn.n_heads, attn.head_dim))
-      q  = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + attn.eps)
-      q_nope, q_rope = torch.split(q, [attn.head_dim - rd, rd], dim=-1)
+      rd = pre_attn.rope_head_dim 
       global_start = cp_rank * chunk_size
       freqs_local = freqs_cis_global[global_start : global_start + chunk]
+      
+      # ── Q 投影（纯本地）────────────────────────────────────────────────                                                                                                    
+      qr = pre_attn.q_norm(pre_attn.wq_a(x))                                                                                                                                   
+      q  = pre_attn.wq_b(qr).unflatten(-1, (pre_attn.n_heads, pre_attn.head_dim))                                                                                              
+      q  = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + pre_attn.eps)                                                                                                   
+      q_nope, q_rope = torch.split(q, [pre_attn.head_dim - rd, rd], dim=-1)
       q_rope = apply_rotary_emb(q_rope, freqs_local)
       q = torch.cat([q_nope, q_rope], dim=-1)   # [B, chunk, n_heads, head_dim]
 
       # ── Window KV 投影（纯本地）───────────────────────────────────────────
-      kv = attn.kv_norm(attn.wkv(x))
-      kv_nope, kv_rope = torch.split(kv, [attn.head_dim - rd, rd], dim=-1)
+      kv = pre_attn.kv_norm(pre_attn.wkv(x))                                                                                                                                   
+      kv_nope, kv_rope = torch.split(kv, [pre_attn.head_dim - rd, rd], dim=-1) 
       kv_rope = apply_rotary_emb(kv_rope, freqs_local)
       kv = torch.cat([kv_nope, kv_rope], dim=-1)   # [B, chunk, head_dim]
 
-      # ── Window KV 边界通信（与 ratio=1 层相同，复用 3.1 节）──────────────
-      recv_buf = torch.zeros_like(kv[:, :window_size, :])
-      boundary_kv = window_boundary_comm(
-          kv[:, -window_size:, :], recv_buf, cp_rank, cp_size, cp_group
-	  ) # rank > 0: [B, 128, head_dim]；rank 0: None
-	  
-	  if cp_rank > 0:
-		  kv_full = torch.cat([boundary_kv, kv], dim=1) # [B, 128+chunk, head_dim]
-	  else:
-		  kv_full = kv # [B, chunk, head_dim]
-	  # ── Window topk 索引（CP 修正，复用 3.1 节）────────────────────────
-	  window_topk = cp_window_topk_idxs(B, chunk, window_size, cp_rank)
-	  # [B, chunk, 128]
-	  
-	  # offset 需要从 kv_full 实际长度算起
-	  offset = kv_full.size(1) # rank 0: chunk；rank r>0: 128+chunk
+      # ── Window KV 边界通信（BoundaryExchange §3.3.2.2，含反向梯度）──────────                                                                                               
+      # 不能用普通 isend/irecv：boundary_kv 参与 attention 计算产生的梯度必须流回 rank r-1                                                                                     
+      boundary_kv = BoundaryExchange.apply(                                                                                                                                    
+	      kv[:, -window_size:, :].contiguous(),                                                                                                                                
+	      cp_rank, cp_size, cp_group, 0.0   # init_value=0.0，rank 0 收到全 0                                                                                                  
+      )                                                                                                                                                                        
+      if cp_rank > 0:                                                                                                                                                          
+          kv_full = torch.cat([boundary_kv, kv], dim=1)  # [B, 128+chunk, head_dim]                                                                                            
+      else:                                                                                                                                                                    
+          kv_full = kv                                     # [B, chunk, head_dim]
 
-      # ── Indexer（x.detach，不传梯度）───────────────────────────────────
+      # ── Window topk 索引（CP 修正）────────────────────────────────────                                                                                                     
+      window_topk = cp_window_topk_idxs(B, chunk, window_size, cp_rank)  # [B, chunk, 128]                                                                                     
+      offset = kv_full.size(1)  # rank 0: chunk；rank r>0: 128+chunk                                                                                                                                                                                                                                                                                      
+      # ── Indexer（detach，不传梯度）─────────────────────────────────────                                                                                                    
       with torch.no_grad():
-          q_indexer, k_indexer_local, weights = indexer_forward_with_cp(
-              attn.indexer, x.detach(), qr.detach(), freqs_cis_global,
-              cp_rank, cp_size, cp_group, chunk_size, ratio,
-          )
-
-      # ── AllGather k_indexer ─────────────────────────────────────────────
+	      q_indexer, k_indexer_local, weights = indexer_forward_with_cp(
+	          attn.indexer, x.detach(), qr.detach(), freqs_cis_global,                                                                                                         
+		      pre_attn.indexer, x.detach(), qr.detach(), freqs_cis_global,                                                                                                     
+		      cp_rank, cp_size, cp_group, chunk_size, ratio,
+      )
       global_k_indexer = AllGatherCompressedKV.apply(k_indexer_local, cp_group)
       # [B, seq_len//4, index_head_dim]
 
-      # ── LiCompute：top-k 选择 （使用全局坐标 offset）──────────────────────
+      # ── LiCompute：top-k 选择 （使用全局坐标）──────────────────────
       compress_topk_idxs, index_score = li_compute_with_cp(
-          attn.li_compute, q_indexer, global_k_indexer, weights,
+          inner_attn.li_compute, q_indexer, global_k_indexer, weights,
           chunk_size, seq_len, cp_rank, ratio, offset,
       )
       # compress_topk_idxs: [B, chunk, topk]，索引从 offset=kv_full.size(1) 起
 
-      # ── 主 Compressor（kv_compress，overlap=True，需 BoundaryExchange）─
+      # ── 主 Compressor（overlap=True，需 BoundaryExchange） ─
       local_kv_compress = compressor_forward_with_cp(
-          attn.compressor, x, freqs_cis_global,
+          pre_attn.compressor, x, freqs_cis_global,
           cp_rank, cp_size, cp_group, chunk_size, ratio,
       )   # [B, chunk//4, head_dim]
 
@@ -950,20 +986,13 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
       causal_kv_compress = global_kv_compress[:, :valid_len, :]
       # [B, (cp_rank+1)*chunk//4, head_dim]
 
-      # ── Sparse Attention ────────────────────────────────────────────────
-      # kv_full 含边界（rank>0）或不含（rank 0），compress_topk_idxs 以 offset 为基准
-      o = attn.sparse_attn(q, kv_full, attn.attn_sink, causal_kv_compress, compress_topk_idxs)
-      o_nope, o_rope = torch.split(o, [attn.head_dim - rd, rd], dim=-1)
-      o_rope = apply_rotary_emb(o_rope, freqs_local, inverse=True)
-      o = torch.cat([o_nope, o_rope], dim=-1)
-
-      # ── LiLoss（使用 causal_kv_compress，满足因果）──────────────────────
-      loss = attn.li_loss(
-          q, causal_kv_compress,
-          q_indexer, global_k_indexer,
-          weights, compress_topk_idxs, index_score,
-          attention_masks, offset,
-      )
+      # ── Sparse Attention（传入修正后的 window_topk_idxs）────────────────                                                                                                  
+      # SparseAttention 需先按零二节修改，增加 window_topk_idxs 参数                                                                                                          
+      o = inner_attn.sparse_attn(                                                                                                                                             
+	      q, kv_full, inner_attn.attn_sink, causal_kv_compress,                                                                                                               
+	      compress_topk_idxs=compress_topk_idxs,                                                                                                                              
+	      window_topk_idxs=window_topk,   # 外部修正的窗口索引，覆盖内部 get_window_topk_idxs                                                                                 
+      1005        )
 
       return o, loss
 ```
