@@ -133,6 +133,12 @@ def validate_cp_alignment(seq_len: int, cp_size: int) -> None:
   ---
 # 三、三类不同层的 CP 通信设计
 
+> [!NOTE] freqs_cis 使用约定
+> 模型维护两套 freqs_cis，CP 各函数的 `freqs_cis_global` 参数需按层类型选择：
+> - ratio=1 层：使用 `model.freqs_cis_wo_compressor`（rope_theta=10000）
+> - ratio=4 / ratio=128 层：使用 `model.freqs_cis`（compress_rope_theta=40000）
+> 这与非 CP 的 `DeepSeekV4Model.forward()` 中的选择逻辑完全一致（`compress_ratios[layer_id] > 1` 时用 `freqs_cis`）。各层的 CP 前向函数统一接收一个 `freqs_cis_global` 参数，调用方负责传入正确的那套。
+
 ## 3.1 ratio=1：Window Attention（P2P 边界通信）
 
 ### 3.1.1 执行流程
@@ -992,8 +998,13 @@ recv_score_slice = BoundaryExchange.apply(score_last, cp_rank, cp_size, cp_group
 	      q, kv_full, inner_attn.attn_sink, causal_kv_compress,                                                                                                               
 	      compress_topk_idxs=compress_topk_idxs,                                                                                                                              
 	      window_topk_idxs=window_topk,   # 外部修正的窗口索引，覆盖内部 get_window_topk_idxs                                                                                 
-      1005        )
-
-      return o, loss
+      )
+      # LiLoss 由外层 TransformerBlock.cal_index_loss 计算，与非 CP 流程完全相同                                                                                              
+      # 返回值对齐非 CP 的 Attention.forward() 输出，供 TransformerBlock 使用                                                                                                 
+      return (                                                                                                                                                                
+	      o, compress_topk_idxs, offset, q,                                                                                                                                   
+	      causal_kv_compress, attention_masks,                                                                                                                                
+	      index_score, q_indexer, global_k_indexer, weights,                                                                                                                  
+      )
 ```
 
