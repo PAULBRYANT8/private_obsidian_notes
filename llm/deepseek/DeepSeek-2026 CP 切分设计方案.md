@@ -18,8 +18,7 @@ CP 切分的挑战主要来自 Attention，不同层的 compress_ratio 决定了
 
 **关于 MHC（Multi-Head Hyper-Connections）**
 > [!NOTE] 模型用的是 MHC，不是单头 HC
-> 代码中 `hc_mult=4`，每个 token 的隐藏状态形状为 `[B, S, 4, D]`，即每个位置
-> 维护 4 个并行 stream，这是 MHC（Multi-Head Hyper-Connections）而非单头 HC。
+> 代码中 `hc_mult=4`，每个 token 的隐藏状态形状为 `[B, S, 4, D]`，即每个位置维护 4 个并行 stream，这是 MHC（Multi-Head Hyper-Connections）而非单头 HC。
 
 MHC 是纯 **per-token** 的局部操作：HcPre / HcPost 的 Sinkhorn 路由只在同一 token 的 `hc_mult=4` 个 stream 之间做加权混合，**不涉及任何跨 token 的序列交互**。CP 将序列按 token 切分，同一 token 的 4 个 stream 始终在同一 rank 上，因此 MHC **不需要任何 CP 通信**，对 CP 完全透明。
 
@@ -144,19 +143,13 @@ def forward(
 
 `BoundaryExchange` 是一个自定义的 PyTorch autograd Function，封装了跨 rank P2P 通信，同时保证反向传播梯度方向正确。三类层均依赖它来传递 CP 边界数据。
 
-**前向传播做什么：**
-
-每个 rank 把自己的 `send_tensor`（上一个 group 的边界数据）发给下一个 rank，同时从上一个 rank 接收对应数据存入 `recv_buf`。通信用 `isend`/`irecv` 非阻塞方式挂起，再统一 `wait()` 等待完成。`init_value` 控制 rank 0 的 `recv_buf` 初始值——rank 0 没有前驱，收不到任何数据，`recv_buf` 保持初始值作为默认边界：
+**前向传播做什么：** 每个 rank 把自己的 `send_tensor`（上一个 group 的边界数据）发给下一个 rank，同时从上一个 rank 接收对应数据存入 `recv_buf`。通信用 `isend`/`irecv` 非阻塞方式挂起，再统一 `wait()` 等待完成。`init_value` 控制 rank 0 的 `recv_buf` 初始值——rank 0 没有前驱，收不到任何数据，`recv_buf` 保持初始值作为默认边界：
 - Window KV 和主 Compressor kv：`init_value=0.0`
 - C4A Compressor score：`init_value=float("-inf")`（与非 CP `overlap_transform` 初始化行为一致）
 
-**反向传播做什么：**
+**反向传播做什么：** 梯度的流向与前向数据流向相反。前向是 rank r-1 → rank r 发数据，反向就是 rank r 把收到的梯度（`grad_recv`）反向发回给 rank r-1，同时从 rank r+1 接收梯度（`grad_send`）。这样训练时梯度能正确流回产生边界数据的 rank，参数才能得到正确更新。
 
-梯度的流向与前向数据流向相反。前向是 rank r-1 → rank r 发数据，反向就是 rank r 把收到的梯度（`grad_recv`）反向发回给 rank r-1，同时从 rank r+1 接收梯度（`grad_send`）。这样训练时梯度能正确流回产生边界数据的 rank，参数才能得到正确更新。
-
-**为什么要封装成 autograd Function 而不是普通函数：**
-
-普通函数里的 `dist.isend`/`irecv` 只在前向执行，PyTorch 不知道如何为它生成反向梯度。封装成 `autograd.Function` 后，可以手动定义 `backward`，显式控制梯度的反向通信路径，确保整条训练链路的梯度正确传播。
+**为什么要封装成 autograd Function 而不是普通函数：** 普通函数里的 `dist.isend`/`irecv` 只在前向执行，PyTorch 不知道如何为它生成反向梯度。封装成 `autograd.Function` 后，可以手动定义 `backward`，显式控制梯度的反向通信路径，确保整条训练链路的梯度正确传播。
 
 ```python
 class BoundaryExchange(torch.autograd.Function):
@@ -245,11 +238,10 @@ class AllGatherCompressedKV(torch.autograd.Function):
 
 ## 3.4 cp_window_topk_idxs
 
-CP 切分后，kv_full = [boundary_kv(128) || local_kv(chunk)]，原始 `GetWindowTopkIdxs` 基于本地坐标 `0..chunk-1` 生成的索引无法访问前 128 个边界 token，必须重新计算。
+CP 切分后，`kv_full = [boundary_kv(128) || local_kv(chunk)]`，原始 `GetWindowTopkIdxs` 基于本地坐标 `0..chunk-1` 生成的索引无法访问前 128 个边界 token，必须重新计算。
 
 > [!IMPORTANT] 不能沿用原 GetWindowTopkIdxs 生成的索引
-> 原 `GetWindowTopkIdxs` 生成的索引基于本地坐标 `0..chunk-1`，拼接边界 token 后
-> local_kv 整体偏移到了位置 128，原有索引无法访问边界 token，**必须重新计算**。
+> 原 `GetWindowTopkIdxs` 生成的索引基于本地坐标 `0..chunk-1`，拼接边界 token 后local_kv 整体偏移到了位置 128，原有索引无法访问边界 token，**必须重新计算**。
 > 换成更简单的理解：由于 CP 切分，rank r 需要接收 rank r-1 后 128 个 token，从而组成新的 kv 矩阵，新矩阵不仅大小发生了改变，每个位置的语义也发生了改变。
 
 **rank 0**（无前驱）：
@@ -258,12 +250,12 @@ CP 切分后，kv_full = [boundary_kv(128) || local_kv(chunk)]，原始 `GetWind
 
 **rank r > 0**（有边界 token）：
 - `kv_full = cat([boundary_kv, local_kv], dim=1)`，形状 `[B, 128+chunk, head_dim]`
-- `kv_full[0:128]` = rank r-1 的末尾 128 个全局 token（全局位置 [r*chunk-128, r*chunk-1]）
+- `kv_full[0:128]` = rank r-1 的末尾 128 个全局 token（全局位置 `[r*chunk-128, r*chunk-1]`）
 - `kv_full[128+j]` = rank r 的本地 token j（全局位置 r * chunk + j）
-- 对 query i（全局位置 r*chunk+i），所需 KV 全局窗口 [r*chunk+i-127, r*chunk+i] 映射到 kv_full 后：
-	- 起点：kv_full[i+1]（对应全局 r*chunk-127+i）
-	- 终点：kv_full[i+128]（对应全局 r*chunk+i）
-	- 即 window_topk[i] = [i+1, i+2, ..., i+128]，恰好 128 个，无需 clamp
+- 对 query i（全局位置 `r*chunk+i`），所需 KV 全局窗口 `[r*chunk+i-127, r*chunk+i]` 映射到 kv_full 后：
+	- 起点：`kv_full[i+1]`（对应全局 `r*chunk-127+i`）
+	- 终点：`kv_full[i+128]`（对应全局 `r*chunk+i`）
+	- 即 `window_topk[i] = [i+1, i+2, ..., i+128]`，恰好 128 个，无需 clamp
 
 ```python
 def cp_window_topk_idxs(bsz: int, chunk: int, window_size: int, cp_rank: int):
