@@ -1065,3 +1065,352 @@ rank r>0:       sparse_attn(..., window_topk_idxs=shifted_indices)
 - `torchtitan_npu/models/deepseek_v4/model/model.py`：`SparseAttention` 末尾加 `_original_forward = forward`
 - `torchtitan_npu/converters/kernels/deepseek_v4_sfa.py`：`sdpa_to_sfa_adapter` 新增 `window_topk_idxs=None` 参数及回调逻辑
 - `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：rank 0 传 `window_topk_idxs=None`，rank r>0 传显式移位索引
+
+---
+
+
+## 5.3 错误三：`compress_topk_idxs` 偏移语义混乱导致 HCCL REDUCE_SCATTER 超时
+
+### 现象
+
+修复错误二后，第一个 step 前向传播正常完成，但在反向传播阶段某个 rank 静默崩溃，导致其他 rank 在 FSDP 的 REDUCE_SCATTER 集合通信中永久等待，触发 300 秒看门狗超时：
+
+```
+[E420 21:27:54.629452030] [Rank 0] Watchdog caught collective operation timeout:
+WorkHCCL(SeqNum=13, OpType=REDUCE_SCATTER, NumelIn=137963680, NumelOut=8622730,
+Timeout(ms)=300000) ran for 300444 milliseconds before timing out.
+```
+
+关键特征：
+
+- **超时发生在 REDUCE_SCATTER**（不是 AllGather）：前向已完成，反向阶段某 rank 崩溃。
+- **NumelIn / NumelOut ≈ 16**：确认 FSDP 规约组包含全部 16 个 rank（dp_shard × cp = 8 × 2），任何一个 rank 在反向崩溃都会导致 rank 0 超时。
+- **无显式 Python 报错**：崩溃在 NPU 内核内部，Python 层没有捕获到异常，rank 0 侧只看到超时。
+
+### 根因分析
+
+#### 两条路径对 `compress_topk_idxs` 的索引语义不同
+
+C4A 层 attention 有两条执行路径，对 `compress_topk_idxs` 的索引语义要求截然不同：
+
+| 路径 | 触发条件 | 对 `compress_topk_idxs` 的要求 |
+|------|----------|-------------------------------|
+| SFA kernel（`npu_sparse_attn_shared_kv`） | rank 0 / 非 CP，`window_topk_idxs=None` | **偏移无关（offset-free）**：直接索引 `cmp_kv`，范围 `[0, valid_len)` |
+| `_original_forward`（SDPA 回退） | rank r>0，`window_topk_idxs` 非 None | **偏移相关（offset-inclusive）**：对拼接后的 `kv_full ‖ kv_compress` 做 scatter，范围 `[offset, offset+valid_len)` |
+
+此外，`cal_index_loss` 路径同样对索引有独立要求：
+
+| 路径 | 触发条件 | 对 `compress_topk_idxs` 的要求 |
+|------|----------|-------------------------------|
+| `li_loss_adapter` → `ms_npu_sparse_lightning_indexer_grad_kl_loss` | 反向传播 | **offset-free**：与非 CP 的 `sdpa_to_li_adapter`（offset=0）保持一致，直接索引 `causal_kv_compress`，范围 `[0, valid_len)` |
+
+#### 原实现的错误
+
+`li_compute_with_cp` 原来在返回 `compress_topk_idxs` 时叠加了 `offset`：
+
+```python
+# 错误：返回的是 offset-inclusive 索引 [offset, offset + k)
+compress_topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+return compress_topk_idxs, index_score
+```
+
+这些带偏移的索引被存入 `_c4a_forward_with_cp` 的返回元组，沿调用链传递：
+
+```
+_c4a_forward_with_cp 返回元组[1]
+  → InnerAttention.forward 的 compress_topk_idxs
+    → TransformerBlock.cal_index_loss
+      → ComputeIndexerLoss.forward
+        → LiLoss.forward（已被 li_loss_adapter 替换）
+          → npu_sparse_lightning_indexer_grad_kl_loss NPU kernel
+```
+
+NPU kernel 期待 offset-free 的 `[0, valid_len)` 索引，而实际接收的是 `[2048, 3199]`（以 seq=4096、cp=2、rank=1 为例，chunk=2048，offset=2048/4=512，但 topk_idxs 已是全局坐标，叠加更大的偏移）。索引远超 `causal_kv_compress` 的维度，会导致 NPU kernel 非法访存。
+
+#### 为何崩溃在反向而非前向
+
+`SparseLightningIndexerGradKLLossWrapper` 采用"延迟计算"设计：
+
+```python
+class SparseLightningIndexerGradKLLossWrapper(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, ...):
+        ctx.save_for_backward(...)
+        # 前向只保存张量，返回 dummy 零值，不做实际计算
+        return torch.zeros(1, dtype=torch.float32, device=query.device)[0]
+
+    @staticmethod
+    def backward(ctx, grad):
+        # 真正的 NPU kernel 在此执行，索引越界在这里才暴露
+        d_query_index, d_key_index, d_weights, loss = ms_npu_sparse_lightning_indexer_grad_kl_loss(...)
+```
+
+前向传播期间只存储张量，不调用真正的 NPU kernel，因此越界访问不会在前向暴露。真正的 kernel 在反向传播时执行，越界导致 NPU 崩溃，但 Python 层没有对应的异常传播机制，表现为 rank 静默失联，最终触发 rank 0 的 HCCL 超时。
+
+#### 同样受影响的 rank 0 SFA 路径
+
+rank 0 走 SFA kernel 路径时，`_c4a_forward_with_cp` 也直接将带偏移的 `compress_topk_idxs` 传给 `sparse_attn`，而 SFA kernel 期待 offset-free 的 `cmp_sparse_indices`，同样会产生错误结果（但不一定立即崩溃，因为 SFA kernel 在前向执行）。
+
+### 修复
+
+**核心原则**：`li_compute_with_cp` 始终返回 **offset-free** 索引；`_c4a_forward_with_cp` 在调用 attention 前根据路径按需叠加偏移，而返回元组中的 `compress_topk_idxs` 始终保持 offset-free 供 `cal_index_loss` 使用。
+
+#### `li_compute_with_cp` 修改
+
+移除 `offset` 参数，返回 offset-free 的 top-k 索引：
+
+```python
+def li_compute_with_cp(
+    li_compute,
+    q_indexer, global_k_indexer, weights,
+    chunk_size, seq_len, cp_rank, ratio,
+    # offset 参数已移除
+):
+    # ... score 计算、causal mask、topk ...
+    mask = topk_idxs >= (base + 1) // ratio
+    # offset-free：索引 causal_kv_compress 的 [0, max_valid) 区间
+    compress_topk_idxs = torch.where(mask, -1, topk_idxs)
+    return compress_topk_idxs, index_score
+```
+
+#### `_c4a_forward_with_cp` 修改
+
+调用 `li_compute_with_cp` 后，根据 attention 路径决定是否叠加 offset：
+
+```python
+# LiCompute 返回 offset-free 索引
+compress_topk_idxs, index_score = li_compute_with_cp(
+    inner_attn.li_compute,
+    q_indexer, global_k_indexer, weights,
+    chunk_size, seq_len, cp_rank, ratio,
+    # 不再传 offset
+)
+
+# attention 路径分叉：
+#   rank r>0（SDPA 路径）：_original_forward 对 kv_full ‖ kv_compress 做 scatter，
+#                           需要 offset-inclusive 索引
+#   rank 0  （SFA 路径）：npu_sparse_attn_shared_kv 直接索引 cmp_kv，
+#                          需要 offset-free 索引
+if window_topk is not None:  # rank r>0: SDPA 路径
+    compress_topk_for_attn = torch.where(
+        compress_topk_idxs == -1,
+        compress_topk_idxs,
+        compress_topk_idxs + offset,
+    )
+else:  # rank 0: SFA kernel，offset-free
+    compress_topk_for_attn = compress_topk_idxs
+
+o = inner_attn.sparse_attn(
+    q, kv_full, inner_attn.attn_sink, causal_kv_compress,
+    compress_topk_idxs=compress_topk_for_attn,  # 按路径选择正确语义
+    window_topk_idxs=window_topk,
+)
+
+# 返回元组始终携带 offset-free 索引供 cal_index_loss 使用
+return (
+    x_out,
+    compress_topk_idxs,   # offset-free ← li_loss_adapter 期待此语义
+    offset,
+    q, causal_kv_compress, attention_masks, index_score,
+    q_indexer, global_k_indexer, weights,
+)
+```
+
+#### 各路径索引语义汇总
+
+```
+compress_topk_idxs（offset-free） ──┬──→ cal_index_loss → li_loss_adapter
+                                    │      → ms_npu_sparse_lightning_indexer_grad_kl_loss ✅
+                                    │
+                                    ├──→ [rank 0]  compress_topk_for_attn = compress_topk_idxs
+                                    │      → SFA kernel (npu_sparse_attn_shared_kv) ✅
+                                    │
+                                    └──→ [rank r>0] compress_topk_for_attn += offset
+                                           → _original_forward (SDPA scatter) ✅
+```
+
+涉及文件：
+- `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：`li_compute_with_cp` 移除 `offset` 参数，返回 offset-free 索引；`_c4a_forward_with_cp` 按路径条件叠加偏移，返回元组中保持 offset-free
+- `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：rank 0 传 `window_topk_idxs=None`，rank r>0 传显式移位索引
+
+---
+
+## 5.4 错误四：cp_rank=0 / cp_rank=1 走不同 attention 路径导致 backward autograd graph 不对称
+
+### 现象
+
+修复错误三后，仍复现完全相同的 REDUCE_SCATTER 超时（SeqNum=13），但 Python 栈显示某些 rank 在反向传播阶段停在 `mhc_triton.py backward → checkpoint recompute → MoE forward → EP AlltoAll`，说明前向已完成，是 backward autograd 图不一致导致 FSDP hook 触发顺序混乱。
+
+### 根因分析
+
+错误三的修复中，`window_topk` 对 rank 0 仍为 `None`，对 rank r>0 为显式索引，导致两条路径通过 `sdpa_to_sfa_adapter` 分叉：
+
+```
+cp_rank=0：window_topk=None → sdpa_to_sfa_adapter → SFA 融合算子（单个黑盒 autograd.Function）
+cp_rank=1：window_topk≠None → sdpa_to_sfa_adapter → _original_forward（纯 PyTorch op 链）
+```
+
+两条路径的 **backward autograd graph 结构不同**：SFA 是一个集中触发的 `Function.backward`，SDPA 是一串 op 各自 backward。FSDP2 通过对参数输出挂 hook 来驱动 per-group pre-backward unshard 和 post-backward REDUCE_SCATTER，两个 CP rank 之间 hook 被触发的时机和相对顺序不对齐，FSDP 集合通信死锁。
+
+### 修复
+
+**让所有 CP rank 走同一条 SDPA（`_original_forward`）路径**：在 `_c1a_forward_with_cp`、`_c128a_forward_with_cp`、`_c4a_forward_with_cp` 三个函数中，`window_topk` 不再依赖 `cp_rank > 0`，所有 rank 始终调用 `cp_window_topk_idxs` 生成显式索引：
+
+```python
+# 修改前（有分叉）
+window_topk = cp_window_topk_idxs(...) if cp_rank > 0 else None
+
+# 修改后（统一 SDPA 路径）
+window_topk = cp_window_topk_idxs(...)
+```
+
+rank 0 的 `cp_window_topk_idxs` 返回标准因果窗口 `[max(0,i-127)..i]`，与 SFA band mode 数学等价，不改变结果。`compress_topk_for_attn` 同步改为无条件加 `offset`（之前 rank 0 不加），使两个 rank 进入相同的 `_original_forward` 执行路径，backward autograd 图结构完全一致。
+
+涉及文件：
+- `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：三个 `*_forward_with_cp` 函数各去掉 `if cp_rank > 0 else None`；`_c4a_forward_with_cp` 的 `compress_topk_for_attn` 无条件加 offset
+
+---
+
+## 5.5 错误五：`BoundaryExchange.backward` P2P 不对称导致 backward 永久阻塞
+
+### 现象
+
+修复错误四后，同一个 REDUCE_SCATTER（SeqNum=13）仍然超时。错误模式：所有偶数 rank（cp_rank=0）SIGABRT，所有奇数 rank（cp_rank=1）SIGTERM。说明 cp_rank=1 的某些 rank 在 backward 中途永久阻塞，从未到达 REDUCE_SCATTER；cp_rank=0 的 rank 等待超时被 HCCL watchdog 杀死；奇数 rank 随后被 elastic launcher 以 SIGTERM 终止。
+
+### 根因分析
+
+`BoundaryExchange.apply` 在前向传播时，rank 0 向 rank 1 发送边界 KV（isend），rank 1 向 rank 0 发送本地边界 KV（isend），双方均 irecv 完成通信。但在**反向传播**时存在不对称：
+
+```
+rank 1 (cp_rank=1):
+  kv_full = cat([boundary_kv, kv])
+  ← boundary_kv 参与 loss 计算，autograd 调用 BoundaryExchange.backward
+  ← backward 执行 isend(grad → rank 0)，等待 rank 0 的 irecv 确认
+
+rank 0 (cp_rank=0):
+  kv_full = kv  （不含 boundary_kv）
+  ← boundary_kv 不在 loss 路径上，autograd 将其剪枝
+  ← BoundaryExchange.backward 根本不被调用
+  ← 不发出 irecv，rank 1 的 isend 永远等不到对端
+
+→ rank 1 永久阻塞在 BoundaryExchange.backward 的 isend.wait()
+→ rank 1 永远到不了 FSDP REDUCE_SCATTER
+→ rank 0 等 REDUCE_SCATTER 超时 → SIGABRT
+→ elastic launcher 杀掉 rank 1 → SIGTERM
+```
+
+P2P 通信不受 HCCL watchdog 监控，因此 rank 1 的阻塞不会触发 watchdog，只有 rank 0 的 REDUCE_SCATTER 超时才会暴露。
+
+### 修复
+
+在 `_c1a_forward_with_cp`、`_c128a_forward_with_cp`、`_c4a_forward_with_cp` 中，对 cp_rank=0 的 `boundary_kv` 添加数值为零的 dummy 依赖，确保 autograd 引擎追踪到 `boundary_kv` 并调用 `BoundaryExchange.backward`：
+
+```python
+boundary_kv = BoundaryExchange.apply(
+    kv[:, -window_size:, :].contiguous(),
+    cp_rank, cp_size, cp_group, 0.0,
+)
+if cp_rank == 0:
+    # boundary_kv 不进入 kv_full，若不做依赖，autograd 会剪枝此节点，
+    # 导致 BoundaryExchange.backward 不被调用，rank1 的 isend 永久阻塞。
+    kv = kv + boundary_kv.sum(dim=(1, 2), keepdim=True) * 0.0
+kv_full = torch.cat([boundary_kv, kv], dim=1) if cp_rank > 0 else kv
+```
+
+**正确性**：
+- 前向：`* 0.0` 保证 kv 数值不变 ✅
+- backward：rank 0 调用 `BoundaryExchange.backward`，执行 `irecv(from rank 1)`，rank 1 的 `isend` 有了对端，双方均正常完成 ✅
+- 梯度：rank 0 的 `grad_recv=0`（来自 dummy 项），但通过 `irecv` 正确接收 rank 1 计算出的 `grad_send`，作为 `send_tensor`（即 `kv[:, -window_size:, :]`）的真实梯度返回，梯度数学上正确 ✅
+
+注意：`compressor_forward_with_cp` 内的两个 `BoundaryExchange`（kv 和 score）对 rank 0 无此问题，因为 `recv_kv`/`recv_score` 通过 `new_kv[:, 0, :ratio] = recv_kv[:, 0]` 实际参与了计算，autograd 不会剪枝。
+
+涉及文件：
+- `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：三个 `*_forward_with_cp` 函数的窗口 KV `BoundaryExchange` 之后各加 `if cp_rank == 0: kv = kv + boundary_kv.sum(...) * 0.0`
+
+---
+
+## 5.6 错误六：`key` 与 `key_index` 序列维度不匹配导致 LiLoss backward SIGSEGV
+
+### 现象
+
+修复错误四、五后，HCCL timeout 消失，训练推进到 backward 计算阶段，但立即触发：
+
+```
+Fatal Python error: Segmentation fault
+
+Current thread (most recent call first):
+  File "torchtitan_npu/converters/kernels/deepseek_v4_sfa.py", line 215 in backward
+  File "torch/autograd/function.py", line 317 in apply
+```
+
+崩溃在 `SparseLightningIndexerGradKLLossWrapper.backward` 调用 `ms_npu_sparse_lightning_indexer_grad_kl_loss`（line 215）。崩溃模式：偶数 rank（cp_rank=0）全部 SIGSEGV，奇数 rank（cp_rank=1）全部 SIGTERM——crash 只发生在 cp_rank=0。
+
+### 根因分析
+
+`li_loss_adapter` 将 `key`（即 `causal_kv_compress`）和 `key_index`（即 `k_indexer`，来自返回元组位置 [8]）一起传入 NPU kernel：
+
+```python
+npu_sparse_lightning_indexer_grad_kl_loss(
+    query,
+    key.unsqueeze(2),        # causal_kv_compress: [B, valid_len, 1, head_dim]
+    query_index,
+    key_index.unsqueeze(2),  # global_k_indexer:   [B, seq//ratio, 1, idx_dim]
+    weights,
+    sparse_indices.unsqueeze(2),
+    ...
+)
+```
+
+NPU kernel 要求 `key.size(1) == key_index.size(1)`，但返回元组中位置 [8] 存的是 **AllGather 后的完整** `global_k_indexer`（序列长度 = `seq_len//ratio`），而 `causal_kv_compress` 已做因果裁剪（序列长度 = `valid_len = (cp_rank+1)*chunk//ratio`）：
+
+| rank | `key`（causal_kv_compress） | `key_index`（global_k_indexer） |
+|------|-----------------------------|--------------------------------|
+| cp_rank=0 | `[B, 512, head_dim]`（valid_len=512） | `[B, 1024, idx_dim]`（seq//ratio） |
+| cp_rank=1 | `[B, 1024, head_dim]` | `[B, 1024, idx_dim]` ✅ |
+
+cp_rank=0 传入 512 vs 1024，NPU kernel 在 C++ 层非法访存，直接 SIGSEGV。cp_rank=1 恰好两者都是 1024，不崩溃——这解释了偶数/奇数 rank 的分裂现象。
+
+### 修复
+
+**主修复**：在 `_c4a_forward_with_cp` 中，将 `global_k_indexer` 裁剪到 `valid_len` 后再放入返回元组：
+
+```python
+# 对 causal_kv_compress 做因果裁剪
+valid_len = (cp_rank + 1) * chunk_size // ratio
+causal_kv_compress = global_kv_compress[:, :valid_len, :]
+
+# 同步裁剪 k_indexer，使序列维度与 causal_kv_compress 匹配
+causal_k_indexer = global_k_indexer[:, :valid_len, :]
+
+return (
+    x_out,
+    compress_topk_idxs,   # offset-free
+    offset,
+    q,
+    causal_kv_compress,
+    attention_masks,
+    index_score,
+    q_indexer,
+    causal_k_indexer,     # ← 裁剪后：size(1)=valid_len，与 causal_kv_compress 匹配
+    weights,
+)
+```
+
+**辅助修复**（`li_loss_adapter`）：增加防御性清洗，解决 CP 路径下的 dtype 问题：
+
+```python
+# CP 路径的 compress_topk_idxs 来自 torch.topk（int64），
+# 非 CP 路径来自 npu_lightning_indexer（int32）。
+# NPU kernel 要求 int32，必须转换。
+valid_len = key.size(1)
+sparse_indices = sparse_indices.to(torch.int32)
+sparse_indices = torch.where(
+    (sparse_indices < 0) | (sparse_indices >= valid_len),
+    torch.full_like(sparse_indices, -1),
+    sparse_indices,
+).contiguous()
+```
+
+涉及文件：
+- `torchtitan_npu/distributed/context_parallel/deepseek_v4_cp.py`：`_c4a_forward_with_cp` 返回元组位置 [8] 改为 `global_k_indexer[:, :valid_len, :]`
+- `torchtitan_npu/converters/kernels/deepseek_v4_sfa.py`：`li_loss_adapter` 增加 `sparse_indices` 的 int32 转换、越界屏蔽和 contiguous 保证
