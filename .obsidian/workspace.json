@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/DeepSeek-2026 CP 切分设计方案.md",
+                "file": "llm/说明/概念说明.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "DeepSeek-2026 CP 切分设计方案"
+              "title": "概念说明"
             }
           }
         ],
@@ -167,13 +167,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/DeepSeek-2026 CP 切分设计方案.md",
+                "file": "llm/说明/概念说明.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "DeepSeek-2026 CP 切分设计方案 的大纲"
+              "title": "概念说明 的大纲"
             }
           },
           {
@@ -207,8 +207,8 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
-    "llm/说明/概念说明.md",
     "llm/deepseek/DeepSeek-2026 CP 切分设计方案.md",
+    "llm/说明/概念说明.md",
     "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
     "Welcome.md",
     "llm/说明",
