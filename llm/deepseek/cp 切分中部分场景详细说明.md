@@ -66,8 +66,44 @@
 	- cmpS2IdLimit = (2048 + 2047 + 1) / 128 = 32  → 能看到全部 32 个压缩 token ✓
 
  ## （3）ori_kv 和 com_kv 两个参数对比
- 
 
-|      | ori_kv        | cmp_kv |
-| ---- | ------------- | ------ |
-| 物理内容 | 原始 KV token（为 |        |
+|         | ori_kv                      | cmp_kv                                |
+| ------- | --------------------------- | ------------------------------------- |
+| 物理内容    | 原始 KV token（未压缩）            | 压缩 KV token（每 128 个原始 token -> 1个）    |
+| 序列长度    | 原始长度（这里是 4096）              | 原始长度 / cmp_ratio（这里是 4096 / 128 = 32） |
+| Mask 模式 | ori_mask_mode = 4：滑动窗口（SWA） | cmp_mask_mode = 3：全局因果（causal）        |
+| 窗口范围    | 精确覆盖最近 128 个token           | 粗粒度覆盖全部历史（每128个token 压缩成一个）           |
+| 精度      | 高精度   局部                    | 低精度   全局                              |
+
+> [!IMPORTANT] 两者互补：ori_kv 负责近处精确看，cmp_kv 负责远处粗粒度看，合起来就是"既看到最近细节，又不失去全局上下文"。两者拼接在一起计算attention
+  $$O = \text{softmax}(Q \cdot \tilde{K}^T \cdot \text{scale}) \cdot \tilde{V}$$  
+  其中 $\tilde{K} = \tilde{V}$ 是把 ori_kv 和 cmp_kv 拼接起来参与计算：    
+  attention_scores = [Q @ K_ori^T | Q @ K_cmp^T]  ← 两段拼接后一起 softmax                                                                                                                                          
+  output          = softmax(scores) @ [V_ori | V_cmp]  
+
+- 举例说明
+```bash
+
+全局序列： 0 ─────────────── 2047 | 2048 ─────────────── 4095
+			rank 0 的 chunk      |    rank 1 的 chunk
+
+
+rank 1 的 query[i](global 位置 2048 + i) 能看见什么？
+	ori_kv（滑动窗口， 精确）：只能看最近 128 个 token：[2048 + 127 - i, 2048 + i]
+			global 位置
+			1921  1922  ...  2047 | 2048  2049  ...  4095
+			   boundary_127       |   local token
+		
+	cmp_kv（因果掩码， 粗粒度）：query[0](global 2048)能看见 16 个压缩块（覆盖 global 0..2047）
+							query[2047](global 4095)能看见 32 个压缩卡ui（覆盖 global 0..4095）
+		block-0  block-1  ...  block-j (j <= (2048 + i + 1)/128)
+		[0..127] [127..255]    最多到第 floor（(2048 + i + 1)/128）块
+```
+
+
+> [!IMPORTANT] ori_kv 和 cmp_kv 合起来，query[i] 实际能看到的内容：
+> 近处：通过 ori_kv 看到完整精确的 128 个token；
+> 远处：通过 cmp_kv 可以看到全部 global 历史，但每 128 个 token 只有 1 个代表
+
+## （4）为什么 ori_kv 需要 padding
+
