@@ -107,3 +107,41 @@ rank 1 的 query[i](global 位置 2048 + i) 能看见什么？
 
 ## （4）为什么 ori_kv 需要 padding
 
+> [!NOTE] 代码源于：ops-transformer/experimental/attention/sparse_attn_sharedkv/op_kernel/arch32/sparse_attn_sharedkv_swa_kernel.h 
+
+```cpp
+
+// 第一步：cmpMaskRight 是从 ori_kv 的 S2-S1 推算出来的！
+            if (constInfo.templateMode == CFA_TEMPLATE) {
+                tempLoopInfo.cmpMaskRight = tempLoopInfo.actOriS2Size - tempLoopInfo.actS1Size;
+                //                                     ↑ 这里用的是 ori_kv 的 S2，不是 cmp_kv 的 S2 
+            }
+
+// 第二步：cmpMaskRight 直接影响 cmp_kv 能看多少个压缩 token
+info.cmpS2IdLimit = (tempLoopInfo.cmpMaskRight + tempLoopInfo.s1EndIdx + 1) / constInfo.cmpRatio;
+```
+
+> [!IMPORTANT] cmp_kv 的因果截止位置是从 ori_kv 的 S2 推算的，两个路径共用同一个"有效 query 位置"。
+
+举例说明：不 padding ori_kv（S2=2175, S1=2048）
+```bash
+  cmpMaskRight = 2175 - 2048 = 127
+  
+  query[i] 能看到的压缩 token 数：
+    cmpS2IdLimit = (127 + i + 1) / 128  
+    
+    i=0   (global 2048)：(128) / 128 = 1    → 只能看 1 个压缩 token！ 
+    i=127 (global 2175)：(255) / 128 = 1    → 还是只有 1 个      
+    i=128 (global 2176)：(256) / 128 = 2    → 2 个  
+    i=2047(global 4095)：(2175) / 128 = 16  → 只有 16 个
+    
+  正确答案（query 在 global 位置 2048+i，cmp_kv 共 32 个 token）：
+    i=0   (global 2048)：应该能看 16 个（块 0..15，覆盖 global 0..2047）
+    i=2047(global 4095)：应该能看 32 个（块 0..31，覆盖 global 0..4095）
+    
+  差距：query[0] 实际只能看到 1 个压缩 token，少了 15 个，全局上下文几乎完全丢失！
+```
+
+
+> [!IMPORTANT] ori_kv 的 padding 表面上是为了修正 ori_kv 自己的窗口，实际真正不可缺少的是为了给 cmp_kv 提供正确的 cmpMaskRight——因为内核用同一个 `S2_ori - S1` 同时驱动两条路径的 mask 计算。
+
