@@ -42,6 +42,18 @@ CP 设计围绕三个问题展开：
 
 `window_size` 表示真实注意力窗口宽度，默认是 128。边界只交换 `window_size - 1` 个 KV，默认 127 个，因为当前 query 对应的 KV 已经在本 rank 的 local KV 中。
 
+为了降低函数参数和返回值复杂度，当前实现把相关数据封装成几个具名结构：
+
+| 结构 | 作用 |
+| --- | --- |
+| `BoundaryExchangeInfo` | 封装 P2P 边界交换需要的 `rank`、`cp_size`、`group`、`init_value` |
+| `CPAttentionModules` | 封装 `pre_attn`、`inner_attn`、`post_attn` 三段 Attention 子模块 |
+| `CPForwardContext` | 封装当前 rank 的 CP 上下文，包括 `rank`、`size`、`group`、`chunk_size`、`window_size` |
+| `C128ACompressTopkConfig` | 封装 C128A 生成 compressed topk 索引所需的配置 |
+| `AttentionForwardOutput` | 用 `NamedTuple` 表达标准 `Attention.forward` 的 10 个返回字段 |
+
+这些封装不改变运行语义，主要是让代码结构更清晰，也避免生产代码里出现过长参数列表、裸 `assert` 和过长 tuple return。
+
 ## 3. Patch 流程
 
 `patch_deepseek_v4_for_context_parallel` 做三件事：
@@ -53,11 +65,15 @@ CP 设计围绕三个问题展开：
 替换后的 `attention_forward_with_cp` 根据 layer 的 `compress_ratio` 分发：
 
 ```text
+attention_forward_with_cp
+  -> 构造 CPAttentionModules
+  -> 构造 CPForwardContext
+
 compress_ratio == 1
-  -> c1a_forward_with_cp
+  -> c1a_forward_with_cp(modules, x, freqs_cis, attention_masks, context)
 
 compress_ratio == 128
-  -> c128a_forward_with_cp
+  -> c128a_forward_with_cp(modules, x, freqs_cis, attention_masks, context)
 
 compress_ratio == 4
   -> NotImplementedError
@@ -70,6 +86,7 @@ C4A 当前不在 CP dispatcher 中支持。
 C1A 和 C128A 都使用 `_exchange_and_concat_boundary_kv`：
 
 ```text
+context: CPForwardContext(rank, size, group, chunk_size, window_size)
 local kv:       [B, chunk, D]
 send tensor:    local kv 的最后 window_size - 1 个 token
 recv tensor:    前一个 rank 发来的 boundary kv
@@ -88,6 +105,19 @@ kv = kv + boundary_kv.sum(...) * 0.0
 ```
 
 这个写法不改变数值，但会把 `BoundaryExchange` 保留在 rank 0 的 autograd 图中，使各 rank 的反向通信路径保持一致。
+
+`BoundaryExchange.apply` 的非 Tensor 参数通过 `BoundaryExchangeInfo` 传入：
+
+```text
+BoundaryExchangeInfo(
+  rank=context.rank,
+  cp_size=context.size,
+  group=context.group,
+  init_value=0.0,
+)
+```
+
+这样 forward 参数更集中；backward 只需要返回 `grad_send` 和 `None`，其中 `None` 对应 `BoundaryExchangeInfo` 没有梯度。
 
 ## 5. C1A 执行流程
 
@@ -115,20 +145,28 @@ freqs_local = freqs_cis_global[global_start : global_start + chunk]
 
 ```text
 c1a_forward_with_cp
-  1. pre_attn(x, freqs_local, None)
+  输入:
+    modules: CPAttentionModules
+    context: CPForwardContext
+
+  1. _local_freqs(freqs_cis_global, x, context)
+       -> chunk, freqs_local
+
+  2. modules.pre_attn(x, freqs_local, None)
        -> q, kv
 
-  2. _exchange_and_concat_boundary_kv(kv)
+  3. _exchange_and_concat_boundary_kv(kv, context)
        rank 0: kv_full = kv
        rank r: kv_full = [boundary_127, kv]
 
-  3. inner_attn.sparse_attn(q, kv_full, attn_sink)
+  4. modules.inner_attn.sparse_attn(q, kv_full, attn_sink)
        使用滑动窗口注意力
 
-  4. post_attn(o, freqs_local, ...)
+  5. modules.post_attn(o, freqs_local, ...)
        输出当前 rank 的局部结果
 
-  5. 返回标准 Attention.forward 的 10 元组
+  6. _c1a_output(...)
+       返回 AttentionForwardOutput
 ```
 
 ### 5.3 窗口对齐逻辑
@@ -158,33 +196,43 @@ C128A 同时有两路 KV：
 
 ```text
 c128a_forward_with_cp
-  1. pre_attn(x, freqs_local, None)
+  输入:
+    modules: CPAttentionModules
+    context: CPForwardContext
+
+  1. _local_freqs(freqs_cis_global, x, context)
+       -> chunk, freqs_local
+
+  2. modules.pre_attn(x, freqs_local, None)
        -> q, local_window_kv, local_kv_compress
 
-  2. _exchange_and_concat_boundary_kv(local_window_kv)
+  3. _exchange_and_concat_boundary_kv(local_window_kv, context)
        rank 0: kv_full = local_window_kv
        rank r: kv_full = [boundary_127, local_window_kv]
 
-  3. offset = kv_full.size(1)
+  4. offset = kv_full.size(1)
        compressed KV 的索引从 window KV 后面开始
 
-  4. AllGatherCompressedKV(local_kv_compress)
+  5. AllGatherCompressedKV(local_kv_compress, context.group)
        -> global_kv_compress
 
-  5. 裁剪因果可见的压缩 KV
-       valid_compress_len = (cp_rank + 1) * (chunk // 128)
+  6. 裁剪因果可见的压缩 KV
+       valid_compress_len = (context.rank + 1) * (chunk // 128)
        causal_kv_compress = global_kv_compress[:, :valid_compress_len, :]
 
-  6. get_c128a_compress_topk_idxs(...)
+  7. get_c128a_compress_topk_idxs(bsz, C128ACompressTopkConfig(...))
        根据全局 query 位置生成 compressed KV 的可见索引
 
-  7. inner_attn.sparse_attn(
+  8. modules.inner_attn.sparse_attn(
        q, kv_full, attn_sink, causal_kv_compress,
        compress_topk_idxs=compress_topk
      )
 
-  8. post_attn(o, freqs_local, ...)
+  9. modules.post_attn(o, freqs_local, ...)
        输出当前 rank 的局部结果
+
+  10. _c128a_output(...)
+       返回 AttentionForwardOutput
 ```
 
 ### 6.2 为什么要 all-gather compressed KV
@@ -211,7 +259,21 @@ rank r 能看 [0, r] 范围内的 compressed KV
 
 ### 6.4 compressed topk 索引
 
-`get_c128a_compress_topk_idxs` 使用全局 query 坐标计算压缩 KV 的可见范围。
+`get_c128a_compress_topk_idxs` 使用全局 query 坐标计算压缩 KV 的可见范围。当前函数签名为：
+
+```text
+get_c128a_compress_topk_idxs(
+  bsz,
+  C128ACompressTopkConfig(
+    chunk,
+    ratio,
+    cp_rank,
+    causal_kv_len,
+    offset,
+    device,
+  ),
+)
+```
 
 对于本 rank 内第 `i` 个 query：
 
@@ -239,6 +301,27 @@ offset = kv_full.size(1)
 
 如果启用了 NPU SFA converter，`SparseAttention.forward` 会替换成 `sdpa_to_sfa_adapter`。这时 CP rank `> 0` 要额外处理 SFA kernel 的位置语义。
 
+当前 `sdpa_to_sfa_adapter` 已拆成几条更清晰的 helper 路径：
+
+```text
+sdpa_to_sfa_adapter
+  -> _ensure_int32_indices
+
+  cp_rank <= 0:
+    -> _run_sfa_with_native_positions
+
+  cp_rank > 0 且 compress_ratio == 128:
+    -> _c128a_cp_sfa_with_global_positions
+
+  cp_rank > 0 且 compress_ratio == 1:
+    -> _c1a_cp_sfa_fallback
+
+  其他情况:
+    -> _c4a_cp_sfa_with_shifted_query
+```
+
+这里的拆分只是代码组织变化，核心语义仍然是：rank0/non-CP 使用 kernel 原生位置；rank>0 需要按不同 attention 类型修正位置或 fallback。
+
 ### 7.1 C128A
 
 C128A 走 `_c128a_cp_sfa_with_global_positions`。
@@ -257,7 +340,7 @@ kv_padded = [zero_prefix, boundary_kv, local_kv]
 
 ### 7.2 C1A
 
-C1A 在 CP rank `> 0` 时走 `SparseAttention.original_forward`，并显式传入 `window_topk_idxs`：
+C1A 在 CP rank `> 0` 时走 `_c1a_cp_sfa_fallback`，内部调用 `SparseAttention.original_forward`，并显式传入 `window_topk_idxs`：
 
 ```text
 window_topk[i] = [i, i + 1, ..., i + window_size - 1]
@@ -271,6 +354,14 @@ window_topk[i] = [i, i + 1, ..., i + window_size - 1]
 
 本地第 `i` 个 query 的正确窗口正好对应 `kv_states[i : i + window_size]`。
 
+### 7.3 Rank0 / Non-CP
+
+rank0 和非 CP 场景走 `_run_sfa_with_native_positions`。这条路径不额外 padding，也不修正 query 位置，因为 kernel 看到的 query/KV 位置就是从当前序列开头开始的标准因果位置。
+
+### 7.4 C4A 预留路径
+
+`sdpa_to_sfa_adapter` 中仍保留 `_c4a_cp_sfa_with_shifted_query`，用于把 C4A 的 query 位置向后平移到 boundary KV 后面。不过 DeepSeek-V4 CP dispatcher 当前对 `compress_ratio == 4` 仍然直接抛 `NotImplementedError`，所以这部分不是当前 C1A/C128A 主链路。
+
 ## 8. 讲解时可以强调的关键点
 
 1. CP 切分的是序列维，但注意力语义仍然是全局序列语义。
@@ -279,7 +370,9 @@ window_topk[i] = [i, i + 1, ..., i + window_size - 1]
 4. `BoundaryExchange` 不只是 forward 通信，还手写了 backward 的反向 P2P 梯度路径。
 5. C128A 的 compressed KV 需要 all-gather，但使用前必须按 rank 裁剪，避免未来信息泄露。
 6. compressed KV 的 topk 索引用全局 query 坐标生成，并通过 `offset` 对齐 `[window_kv, compressed_kv]` 的拼接布局。
-7. SFA converter 下，rank `> 0` 要修正 kernel 的位置理解，否则边界 KV 和 compressed KV 的因果关系会错位。
+7. `CPForwardContext` 和 `CPAttentionModules` 让 C1A/C128A 共享同一套上下文和模块传递方式，减少重复参数。
+8. `AttentionForwardOutput` 保持了标准 10 字段返回协议，但用具名字段表达，便于讲解和维护。
+9. SFA converter 下，rank `> 0` 要修正 kernel 的位置理解，否则边界 KV 和 compressed KV 的因果关系会错位。
 
 ## 9. 当前支持范围
 
