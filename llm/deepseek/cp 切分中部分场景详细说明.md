@@ -53,37 +53,21 @@
 	- oriMaskLeft  = 2048 + 0 - 127 = 1921  → kv_padded[1921]  ✓（同上）
 		- 窗口 = kv_padded[1921..2048]  ← 完全一样！
 	- cmpS2IdLimit = (2048 + 0 + 1) / 128 = 16  → 能看到 16 个压缩 token ✓（同上）
+
+- 再验证 query_states[2047]（= real query[2047]，global 位置 4095）：
+	- s1EndIdx = 2048
+	- S2 - S1  = 2048
 	- 
-	- 再验证 query_states[2047]（= real query[2047]，global 位置 4095）：                                                                                                                                               
-	                  
+	- oriMaskRight = 2048 + 2047 + 0   = 4095  → kv_padded[4095]  ✓
+	- oriMaskLeft  = 2048 + 2047 - 127 = 3968  → kv_padded[3968]  ✓
+		- 窗口 = kv_padded[3968..4095]
+		- = kv_states[3968-1921..4095-1921] = kv_states[2047..2174]  ✓
+	 
+	- cmpS2IdLimit = (2048 + 2047 + 1) / 128 = 32  → 能看到全部 32 个压缩 token ✓
 
+ ## （3）ori_kv 和 com_kv 两个参数对比
+ 
 
-  oriMaskRight = 2048 + 0 + 0   = 2048  → kv_padded[2048]  ✓（同上）
-  oriMaskLeft  = 2048 + 0 - 127 = 1921  → kv_padded[1921]  ✓（同上）
-    窗口 = kv_padded[1921..2048]  ← 完全一样！
-
-  cmpS2IdLimit = (2048 + 0 + 1) / 128 = 16  → 能看到 16 个压缩 token ✓（同上）
-
-  再验证 query_states[2047]（= real query[2047]，global 位置 4095）：
-  以 query_states[0]（= real query[0]，global 位置 2048）为例：
-
-  s1EndIdx = 0           ← local index 就是 0
-  S2 - S1  = 4096 - 2048 = 2048   ← 这个差值承担了"偏移"的作用
-
-  oriMaskRight = 2048 + 0 + 0   = 2048  → kv_padded[2048]  ✓（同上）
-  oriMaskLeft  = 2048 + 0 - 127 = 1921  → kv_padded[1921]  ✓（同上）
-    窗口 = kv_padded[1921..2048]  ← 完全一样！
-
-  cmpS2IdLimit = (2048 + 0 + 1) / 128 = 16  → 能看到 16 个压缩 token ✓（同上）
-
-  再验证 query_states[2047]（= real query[2047]，global 位置 4095）：
-
-  s1EndIdx = 2047
-  S2 - S1  = 2048
-
-  oriMaskRight = 2048 + 2047 + 0   = 4095  → kv_padded[4095]  ✓
-  oriMaskLeft  = 2048 + 2047 - 127 = 3968  → kv_padded[3968]  ✓
-    窗口 = kv_padded[3968..4095]
-    = kv_states[3968-1921..4095-1921] = kv_states[2047..2174]  ✓
-
-  cmpS2IdLimit = (2048 + 2047 + 1) / 128 = 32  → 能看到全部 32 个压缩 token ✓
+|      | ori_kv        | cmp_kv |
+| ---- | ------------- | ------ |
+| 物理内容 | 原始 KV token（为 |        |
