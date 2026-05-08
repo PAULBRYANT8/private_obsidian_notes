@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/deepseek-v4 cp实现.md",
+                "file": "llm/deepseek/deepseek_v3 cp.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "deepseek-v4 cp实现"
+              "title": "deepseek_v3 cp"
             }
           }
         ],
@@ -167,13 +167,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/deepseek-v4 cp实现.md",
+                "file": "llm/deepseek/deepseek_v3 cp.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "deepseek-v4 cp实现 的大纲"
+              "title": "deepseek_v3 cp 的大纲"
             }
           },
           {
@@ -207,8 +207,9 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
-    "llm/deepseek/cp 切分中部分场景详细说明.md",
     "llm/deepseek/deepseek-v4 cp实现.md",
+    "llm/deepseek/deepseek_v3 cp.md",
+    "llm/deepseek/cp 切分中部分场景详细说明.md",
     "llm/deepseek/DeepSeek-2026 CP 切分设计方案.md",
     "llm/deepseek/补充知识.md",
     "llm/deepseek/未命名.md",
