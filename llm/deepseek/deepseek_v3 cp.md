@@ -291,67 +291,17 @@ TorchTitan 0.2.2 后，CP 的接入方式更偏向模型并行化阶段的模块
 
   
 
-本次需求实现总体采用“保持 TorchTitan 0.2.2 主流程不变、在 NPU patch 层补充模型相关 CP 能力”的方式完成。训练数据的 CP 切分、模型并行化调度、FSDP/TP/EP 等主体流程仍沿用 TorchTitan 0.2.2 的框架能力；NPU patch 主要负责在合适的阶段识别 DeepSeek V3 和 DeepSeek V3.2，并将 attention 模块路由到适合 NPU 的 Ulysses CP 或 DSA CP 实现。这样既可以减少对上游框架主流程的侵入，又能保留旧仓中已经验证过的自定义 CP 能力。
+本次需求实现总体采用“保持 TorchTitan 0.2.2 主流程不变、在 NPU patch 层补充模型相关 CP 能力”的方式完成。训练数据切分、模型并行化调度、FSDP/TP/EP 等主体流程仍沿用 TorchTitan 0.2.2 的框架能力；NPU patch 负责在模型并行化阶段识别 DeepSeek V3 和 DeepSeek V3.2，并将 attention 模块自动路由到 Ulysses CP 或 DSA CP。这样可以降低对上游框架的侵入，同时保留旧仓中已经验证过的自定义 CP 能力。
 
-  
+在配置和分发逻辑上，当前实现保留 `enable_custom_context_parallel` 作为统一开关，不再要求用户配置 `custom_context_parallel_path`。模型开启 CP 后，由并行化流程根据模型类型和 converter 配置自动选择 CP 类型。DeepSeek V3 自动进入 Ulysses CP，DeepSeek V3.2 在启用 `npu_dsa` converter 时进入 DSA CP，其他 attention 类型仍回退 TorchTitan 原生 CP。同时，分发阶段会提前完成必要校验，例如 Ulysses CP 的序列长度和注意力头数整除关系，以及 DSA CP 对 `npu_dsa` converter 的依赖。
 
-从整体设计上看，本实现分为三层。第一层是配置和初始化层，用于注册 NPU patch、扩展必要配置项，并保证 DeepSeek V3.2 等 NPU 模型能够被 TorchTitan 正常识别。第二层是 CP 分发层，用于接管 TorchTitan 的 attention CP 应用入口，根据模型类型、CP 开关和 converter 配置自动选择 CP 类型。第三层是模型实现层，DeepSeek V3 进入 Ulysses CP 路径，DeepSeek V3.2 进入 DSA CP 路径，并分别处理 attention 内部通信、NPU 融合算子调用、RoPE 全局位置、TP/CP 同开以及 loss 统计等问题。
+DeepSeek V3 的实现以复用 TorchTitan 0.2.2 原生模型主体为主，仅在并行化入口外层增加 NPU 适配逻辑。未开启 CP 或 CP degree 为 1 时，训练流程走原生路径；开启自定义 CP 后，DeepSeek V3 的 attention 会切换到 Ulysses CP。Ulysses CP 的核心是在 SDPA 前后插入 all-to-all 通信，计算前将序列维切分的数据转换为“完整序列 + 部分 attention head”的布局，计算后再恢复为序列维切分布局，从而保证 attention 看到完整上下文，并保持后续模块的 CP 输入格式不变。
 
-  
+DeepSeek V3.2 的实现重点是适配 DSA 场景。开启 CP 且启用 `npu_dsa` 后，attention 会进入 DSA CP 路径。该路径会在 CP 域内聚合 DSA 所需的 KV、Indexer KV 和 RoPE KV，并按照当前 CP rank 的因果可见范围进行裁剪，再调用 NPU lightning indexer、sparse flash attention 和 indexer loss 融合算子。这样可以保证稀疏索引、注意力计算和 indexer loss 都符合全序列因果语义。
 
-具体实现方式上，首先在配置层保留 `enable_custom_context_parallel` 作为 NPU 自定义 CP 的统一开关，并移除旧仓对 `custom_context_parallel_path` 的依赖。旧仓需要用户在配置文件中显式指定自定义 CP 类路径，新实现则由模型并行化过程自动选择 CP 类型。这样可以降低配置复杂度，也可以避免不同模型配置错 CP Context 导致运行时行为不一致。
+为保证反向梯度和 TP/CP 组合正确，DSA CP 的 all-gather 通信采用带反向语义的分布式实现，前向向 NPU 算子提供普通 Tensor，反向保持等价 reduce-scatter 的梯度传播。TP 与 CP 同时开启时，会对 DSA indexer loss 所需的 head 相关输入做必要聚合，避免 TP 切分导致 loss kernel 输入不完整；position ids 使用复制语义，避免被 TP 错误切分。
 
-  
-
-其次，在 CP 分发层接管 TorchTitan 0.2.2 的 attention CP 应用入口。模型并行化阶段调用 CP 应用入口时，NPU patch 会根据传入的 attention type 做分发：当 attention type 为 `ulysses` 时，进入 DeepSeek V3 的 Ulysses CP 逻辑；当 attention type 为 `dsa` 时，进入 DeepSeek V3.2 的 DSA CP 逻辑；其他 attention type 仍回退 TorchTitan 原生 CP 处理。该分发逻辑还会做必要的配置校验，例如 Ulysses CP 需要校验序列长度、注意力头数和 TP/CP 组合的整除关系，DSA CP 需要校验配置中已经启用 `npu_dsa` converter。
-
-  
-
-DeepSeek V3 的具体实现方式是复用 TorchTitan 0.2.2 原生模型主体，在并行化入口外层增加 NPU wrapper。未开启自定义 CP 或 CP degree 为 1 时，训练流程直接回退到原生并行化逻辑；开启自定义 CP 且 CP degree 大于 1 时，wrapper 会将 DeepSeek V3 的 attention CP 路由强制切换为 Ulysses CP，并把模型参数和任务配置传入后续校验流程。DeepSeek V3 还复用 NPU 适配后的 MoE EP/TP 并行计划，用于保证 MoE 参数、router、shared experts 和 experts 在 TP/EP 组合下的 layout 与 NPU fused/grouped matmul 路径保持一致。
-
-  
-
-DeepSeek V3 的 Ulysses CP 在 attention 内部插入两次 all-to-all 通信。进入 attention 时，q/k/v 原本按照序列维被 CP 切分，单个 rank 只持有局部序列片段。第一次 all-to-all 会沿 attention head 维切分、沿 sequence 维聚合，使每个 rank 在 SDPA 计算时持有完整序列上下文和部分 attention head。SDPA 计算完成后，第二次 all-to-all 会执行反向的数据重排，将输出恢复为按序列维切分的布局，继续交给后续 transformer block 处理。该 all-to-all 通信包含自定义反向逻辑，backward 阶段会交换前向的 scatter/gather 维度，使梯度通信与前向数据重排保持一致。
-
-  
-
-DeepSeek V3.2 的实现方式与 DeepSeek V3 不同。DeepSeek V3.2 在 NPU patch 仓中提供了独立的模型注册、模型结构和并行化方案，并在 TorchTitan 0.2.2 的并行化框架基础上补充 DSA 相关能力。并行化阶段保留序列长度整除约束、mixed precision 训练对 FSDP 的约束，以及 `npu_gmm` 对 TP/EP 组合的限制，避免模型在不支持的并行组合下进入训练。
-
-  
-
-DeepSeek V3.2 开启 CP 时，并行化逻辑会收集所有 transformer block 中的 inner attention 模块，并调用 CP 应用入口。默认情况下 attention type 使用模型参数中的设置；当模型仍显示为 `sdpa`，但 converter 中已经启用 `npu_dsa` 时，NPU patch 会将 CP attention type 覆盖为 `dsa`。这样做是因为 DeepSeek V3.2 的实际计算需要进入 NPU sparse attention 和 lightning indexer 相关算子，如果仍按普通 SDPA CP 处理，DTensor dispatcher 可能会拦截 NPU 自定义算子，导致运行失败或语义不正确。路由到 DSA CP 时，还会传入模型参数、任务配置和可选 TP mesh，以便后续同时处理 converter 校验、模型参数访问和 TP 场景下的 head 聚合。
-
-  
-
-DSA CP 的核心是在 attention forward 中补充 CP 感知能力。进入 DSA CP 后，系统会为 DeepSeek V3.2 的 sparse attention 模块绑定 CP mesh、模型参数和 TP mesh，并将 indexer loss 的实现切换为 NPU 融合 loss 路径。随后，attention forward 被替换为 CP 感知版本，使其能够在 CP 域内聚合必要的 KV、Indexer KV 和 RoPE KV，并在调用 NPU sparse attention 前完成因果裁剪。
-
-  
-
-DSA CP forward 首先要求 k 和 v 的 KV head 数为 1，即当前实现面向 MLA absorb 场景。随后，逻辑会在 CP 域内 all-gather Indexer K，得到当前 CP group 内完整的 indexer key。为了保持因果语义，当前 rank 只能访问从序列开始到本 rank 末尾的 key 范围，因此实现会根据 CP rank 和局部序列长度计算可见边界，并对聚合后的 key/indexer key 做裁剪。NPU lightning indexer 使用局部 query indexer、裁剪后的 key indexer 和权重生成稀疏 top-k 索引，这些索引随后作为 NPU sparse flash attention 的输入。
-
-  
-
-主注意力计算阶段会将 q/k/v 调整为 NPU sparse attention 需要的布局，并拆分出 no-position 部分和 RoPE 部分。K 的 no-position 部分、V 以及 RoPE K 会分别在 CP 域内 all-gather，再按照当前 rank 的因果可见边界裁剪，保证 attention 只能访问历史 token 和当前 token。随后调用 NPU sparse flash attention，其中 sparse mode 使用 DSA 所需的右下因果稀疏模式，attention mode 使用 MLA absorb 模式，并要求返回 softmax 相关中间量。attention 输出用于后续投影，softmax max 和 softmax sum 则继续参与 NPU indexer loss 计算。
-
-  
-
-DSA CP 中的 all-gather 需要兼顾前向算子兼容性和反向梯度正确性。当前实现默认使用 DTensor 语义完成通信：前向阶段先把局部 tensor 标记为序列维切分，再重分布为复制布局，然后转为普通 Tensor 传给 NPU 自定义算子，避免 NPU 算子被 DTensor dispatcher 干扰；反向阶段再将梯度包装为 partial 语义，使分布式框架完成等价 reduce-scatter 的梯度回传。这样既保持了 NPU 算子调用的普通 Tensor 输入形式，也保证了 CP all-gather 的反向传播语义。
-
-  
-
-TP 与 DSA CP 同时开启时，还需要处理 head 维切分带来的输入完整性问题。DeepSeek V3.2 的 TP 并行计划会分别处理 indexer、inner attention、post attention、MoE 和 FFN 模块。CP 开启时，position ids 使用复制语义，避免被 TP 错误切分。对于 DSA indexer loss，query、RoPE query、softmax max 和 softmax sum 会在 TP 维做必要聚合，保证 NPU loss kernel 看到满足要求的完整 head 数。MLA absorb 路径下，还会对指定输入注册 backward all-reduce，保证相关梯度在 TP group 内同步。activation checkpoint 开启时，对可能产生异步重分布的 rowwise 路径增加等待逻辑，避免重算场景下通信残留影响显存和正确性。
-
-  
-
-RoPE 全局位置是 CP 精度一致性的关键。TorchTitan 0.2.2 的 CP 输入准备逻辑会生成 position ids，当前实现对 RoPE broadcast 逻辑做了适配，使模型能够按照全局 position 从全局 RoPE 表中取对应位置，而不是让每个 CP rank 都从位置 0 开始。DeepSeek V3.2 的 indexer、pre attention、attention、transformer block 和模型 forward 链路均透传 position ids。这样，CP rank 1 以及后续 rank 会使用其在全局序列中的真实 token 位置，从而保证 CP 与非 CP 的 RoPE 语义一致。
-
-  
-
-DeepSeek V3.2 的 DSA CP 还需要保证输入序列按 rank 顺序连续切分。DSA CP 中的因果边界计算默认每个 CP rank 持有连续的全局序列片段，如果使用 HeadTail load balance，rank 上的 token 顺序不再等价于连续全局序列，会破坏 lightning indexer 和 sparse attention 的因果裁剪。因此当前实现会在 DeepSeek V3.2 + DSA 场景下临时关闭 CP load balance，强制使用顺序切分。
-
-  
-
-DSA indexer loss 的记录也做了分布式适配。DeepSeek V3.2 每层产生的 indexer loss 会先记录到本地 tracker 中，统计时再执行一次全局 all-reduce 求平均。PP 场景下，由于不同 PP stage 只持有部分层，非本 stage 的层在某些 rank 上为 0，因此需要乘以 PP degree 修正全局平均的数学期望。最终 indexer loss 会按层数和 gradient accumulation steps 归一化，并在日志中记录全局一致的数值。非日志 step 会清理 tracker，避免 indexer loss 跨 step 累积影响后续统计。
+为保证精度一致性，当前实现补充了 RoPE 全局位置适配，使 CP 场景下每个 rank 都按照真实全局 token 位置取 RoPE，而不是从局部位置 0 重新开始。DeepSeek V3.2 的 DSA CP 还强制使用顺序序列切分，避免 HeadTail load balance 打乱 token 顺序后破坏因果裁剪。DSA indexer loss 的日志统计也做了分布式同步，能够在 TP、CP、DP、PP 等并行维度下输出全局一致的指标，并在非日志 step 及时清理临时统计值。
 
   
 
