@@ -44,13 +44,13 @@ CP 设计围绕三个问题展开：
 
 为了降低函数参数和返回值复杂度，当前实现把相关数据封装成几个具名结构：
 
-| 结构 | 作用 |
-| --- | --- |
-| `BoundaryExchangeInfo` | 封装 P2P 边界交换需要的 `rank`、`cp_size`、`group`、`init_value` |
-| `CPAttentionModules` | 封装 `pre_attn`、`inner_attn`、`post_attn` 三段 Attention 子模块 |
-| `CPForwardContext` | 封装当前 rank 的 CP 上下文，包括 `rank`、`size`、`group`、`chunk_size`、`window_size` |
-| `C128ACompressTopkConfig` | 封装 C128A 生成 compressed topk 索引所需的配置 |
-| `AttentionForwardOutput` | 用 `NamedTuple` 表达标准 `Attention.forward` 的 10 个返回字段 |
+| 结构                        | 作用                                                                     |
+| ------------------------- | ---------------------------------------------------------------------- |
+| `BoundaryExchangeInfo`    | 封装 P2P 边界交换需要的 `rank`、`cp_size`、`group`、`init_value`                   |
+| `CPAttentionModules`      | 封装 `pre_attn`、`inner_attn`、`post_attn` 三段 Attention 子模块                |
+| `CPForwardContext`        | 封装当前 rank 的 CP 上下文，包括 `rank`、`size`、`group`、`chunk_size`、`window_size` |
+| `C128ACompressTopkConfig` | 封装 C128A 生成 compressed topk 索引所需的配置                                    |
+| `AttentionForwardOutput`  | 用 `NamedTuple` 表达标准 `Attention.forward` 的 10 个返回字段                     |
 
 这些封装不改变运行语义，主要是让代码结构更清晰，也避免生产代码里出现过长参数列表、裸 `assert` 和过长 tuple return。
 
