@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/未命名.md",
+                "file": "llm/deepseek/未命名 2.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "未命名"
+              "title": "未命名 2"
             }
           }
         ],
@@ -167,13 +167,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/未命名.md",
+                "file": "llm/deepseek/未命名 2.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "未命名 的大纲"
+              "title": "未命名 2 的大纲"
             }
           },
           {
@@ -207,6 +207,8 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
+    "llm/deepseek/未命名.md",
+    "llm/deepseek/未命名 2.md",
     "执行命令/ubuntu/清理垃圾的命令.md",
     "llm/deepseek/未命名 1.md",
     "llm/deepseek/deepseek_v4 C1A_C4A_C128A 对比.md",
@@ -215,7 +217,6 @@
     "llm/deepseek/cp 切分中部分场景详细说明.md",
     "llm/deepseek/deepseek_v3 cp.md",
     "llm/deepseek/补充知识.md",
-    "llm/deepseek/未命名.md",
     "llm/说明/概念说明.md",
     "Pasted image 20260507095210.png",
     "llm/说明/torchtitan v021 -> v022 cp切分的版本升级.md",
