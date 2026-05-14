@@ -25,7 +25,7 @@ output
 1. 非首 PP stage 收到的是上一 stage 的 hidden state，却在 `forward()` 中把它误当作原始 token ids，重新生成 `input_ids`。
 2. 最后 PP stage 缺少 `hc_head`，导致 `output` 直接作用于 `[B, S, hc_mult, D]`，产生错误 logits shape。
 
-## 2. error_1.log 的直接根因
+## 2. 4层压缩模型报错的直接根因
 
 `deepseek_v4_285b_4layers_debug.toml` 设置：
 
@@ -65,7 +65,7 @@ h = tokens[:, :seq_len]
 
 因此 `error_1.log` 的直接根因是：`input_ids` 没有作为 sidecar 数据跨 PP stage 传递。
 
-## 3. error.log 的直接根因
+## 3. 43层模型报错的直接根因
 
 `deepseek_v4_285b_43layers_4k_128die.toml` 中最后 stage 日志为：
 
@@ -169,7 +169,7 @@ pipelining_fn=pipeline_deepseek_v4
 
 通用规则应为：
 
-1. 根据 `pipeline_parallel_degree` 和 schedule 计算 virtual stage 数。
+1. 根据 `pipeline_parallel_degree` 和 schedule 计算 virtual stage 数。（num_virtual_stage = parallel_dims.pp * stages_per_rank）
 2. 将 `layers.0 ... layers.N-1` 按 `n_layers` 均匀分到所有 virtual stages。
 3. 第一个 virtual stage 固定包含：
 
