@@ -169,7 +169,7 @@ pipelining_fn=pipeline_deepseek_v4
 
 通用规则应为：
 
-1. 根据 `pipeline_parallel_degree` 和 schedule 计算 virtual stage 数。（num_virtual_stage = parallel_dims.pp * stages_per_rank）
+1. 根据 `pipeline_parallel_degree` 和 schedule 计算 virtual stage 数。（num_virtual_stage = parallel_dims.pp * stages_per_rank，这里的stages_per_rank大小是在代码里根据pipeline schedule推导出来的，如果是single-stage schedule，每个rank只放一个stage，如果是multi-stage schedule，例如当前在toml文件中写的pipeline_parallel_schedule="Interleaved1F1B"，那么stage_per_rank=2；如果在toml文件中显示配置pipeline_parallel_layers_per_stage的值，则等于该值）
 2. 将 `layers.0 ... layers.N-1` 按 `n_layers` 均匀分到所有 virtual stages。
 3. 第一个 virtual stage 固定包含：
 
