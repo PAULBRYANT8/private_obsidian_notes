@@ -515,3 +515,252 @@ loss = per_layer_loss.mean()
 4. 后续单独验证 MTP+PP
    - 引入 `mtp_input_offsets` sidecar。
    - 验证最后 stage 返回 `[main_logits, mtp_logits, ...]`。
+
+
+
+
+
+
+
+这段逻辑是从 PyTorch PipelineStage 的几个行为推出来的。按代码链路看：
+
+1. 我们的 DeepSeekV4 PP forward 现在做了什么
+
+在 model.py (line 1367)：
+
+python
+
+
+
+input_ids = tokens[:, :seq_len].detach().long()
+input_ids_sidecar = input_ids.detach().to(torch.float32)
+
+
+
+非 last stage 返回时：
+
+python
+
+
+
+if self.output is None:
+    return h, self._pp_sidecar_for_send(input_ids_sidecar)
+
+
+
+_pp_sidecar_for_send() 保证 sidecar 是 float32：
+
+python
+
+
+
+if input_ids_sidecar.dtype == torch.float32:
+    return input_ids_sidecar
+return input_ids_sidecar.to(torch.float32)
+
+
+
+后续 stage 收到后，再转回 long：
+
+python
+
+
+
+return input_ids.detach().long()
+
+
+
+也就是：
+
+text
+
+
+
+long token id -> float32 sidecar 跨 PP 传输 -> long token id 用于 MoE/hash routing
+
+
+
+2. PyTorch Pipeline 会把 tuple output 拆成多个 tensor output
+
+PyTorch v2.10.0-rc2 的 PipelineStage.forward_one_chunk() 里，stage forward 结果会被标准化成 tuple：
+
+python
+
+
+
+output = self.forward_maybe_with_nosync(...)
+output_tuple = _normalize_model_output_as_tuple(output)
+
+
+
+所以我们返回：
+
+python
+
+
+
+return h, input_ids_sidecar
+
+
+
+会变成：
+
+text
+
+
+
+output_tuple = (h, input_ids_sidecar)
+
+
+
+然后 forward send 会逐个发送 tuple 里的 tensor：
+
+python
+
+
+
+for idx, out in enumerate(output_tuple):
+    ...
+    ops.append(dist.P2POp(dist.isend, out, peer_global_rank, self.group))
+
+
+
+所以 input_ids_sidecar 会被当成正常 activation tensor 发送给下一个 stage。
+
+3. 接收端会把收到的 activation buffer 设成 requires_grad=True
+
+跨 rank 接收路径里，PyTorch 会根据 output meta 创建 recv buffer，然后：
+
+python
+
+
+
+if self.has_backward:
+    buffer.requires_grad_(True)
+
+
+
+同 rank virtual stage 直传路径里也是类似逻辑：
+
+python
+
+
+
+info.buffer = tensor.detach().requires_grad_(True)
+
+
+
+这就是关键点：Pipeline runtime 不知道哪个 tensor 是“sidecar metadata”，它把所有 stage 输入 tensor 都当成需要反向收集梯度的 activation。
+
+如果这里传的是原始 torch.long，类似下面这样会出问题：
+
+python
+
+
+
+x = torch.empty(4, dtype=torch.long)
+x.requires_grad_(True)
+
+
+
+PyTorch 不允许整数 tensor requires_grad=True，因为 autograd 梯度只定义在浮点/复数 tensor 上。
+
+所以 input_ids 不能直接用原始 long 形式作为 pipeline activation tensor 传下去。
+
+4. backward 还会要求每个收到的 tensor 都有对应 grad
+
+PyTorch PipelineStage 会为所有收到的 forward tensor 建立 backward send 信息。代码逻辑是：只要是 _RecvInfo，就记录它的 source stage。
+
+后面 backward 结束时，stage_backward() 会取每个输入 tensor 的 .grad：
+
+python
+
+
+
+for val in input_values:
+    if isinstance(val, torch.Tensor):
+        grad_inputs.append(val.grad)
+
+
+
+然后 get_bwd_send_ops() 会检查：
+
+python
+
+
+
+for grad, grad_recv_stage in zip(grads_input, self.grad_send_info):
+    if isinstance(grad, torch.Tensor) and grad_recv_stage is not None:
+        send grad
+    else:
+        if not (grad is None and grad_recv_stage is None):
+            raise RuntimeError(...)
+
+
+
+这就是你之前看到的报错来源：
+
+text
+
+
+
+has gradients None and is expecting to send gradients to stage ...
+
+
+
+所以 sidecar 只是转成 float32 还不够。它还必须在 autograd 图里有一条“零梯度路径”。我们现在加的是：
+
+python
+
+
+
+h = h + input_ids_sidecar.to(device=h.device, dtype=h.dtype).sum() * 0.0
+
+
+
+它不会改变 h 的数值，但会让 input_ids_sidecar.grad 变成合法的 0 tensor，而不是 None。
+
+推导结论
+
+从代码链路看：
+
+text
+
+
+
+Pipeline tuple output
+-> 每个 tensor 都会作为 activation 发送
+-> 接收端 activation buffer 会 requires_grad_(True)
+-> backward 会期待每个收到的 tensor 都能产出 grad
+
+
+
+因此：
+
+text
+
+
+
+原始 long input_ids 不适合作为 PP tensor payload
+
+
+
+所以改成：
+
+text
+
+
+
+long -> float32 sidecar -> long
+
+
+
+并额外加零梯度依赖，才能同时满足：
+
+text
+
+
+
+1. token id 信息不丢
+2. Pipeline 接收端可以 requires_grad
+3. backward 阶段不会拿到 None grad
