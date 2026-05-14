@@ -207,6 +207,10 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
+    "1.pub",
+    "1",
+    "\u001b[A\u001b[D.pub",
+    "\u001b[A\u001b[D",
     "llm/deepseek/deepseek_v4 PP + MTP 报错分析与修复方案.md",
     "llm/deepseek/DeepSeekV4 PP 通用修复方案.md",
     "llm/deepseek/未命名 1.md",
@@ -232,8 +236,6 @@
     "sync.log",
     "sync.sh",
     "llm/deepseek",
-    "llm",
-    "每日知识总结.md",
-    "Untitled"
+    "每日知识总结.md"
   ]
 }
