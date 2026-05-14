@@ -229,6 +229,9 @@ h = tokens[:, :seq_len]
 ```
 
 应改成：首 stage 生成真实 `input_ids`，并把它作为 sidecar payload 传给后续 stage。
+每个非首 stage 都应该收到并继续透传 input_ids；
+包含 hash routing layer 的 stage 会实际使用它；
+不包含相关 layer 的 stage 只是把它传给后面。
 
 首 stage：
 
