@@ -2,10 +2,10 @@
 
 ## 背景与 CP 分支对应关系
 
-| 模型 | CP 分支 | 实现模块（本文件引用） |
-|------|---------|------------------------|
-| DeepSeek V32 | **DSA** 分支 | `torchtitan_npu.distributed.context_parallel.dsa_cp`；注意力侧为 `DSV32_SDPA`（`torchtitan_npu.models.deepseek_v32.model.model`） |
-| DeepSeek V3 | **Ulysses** 分支 | `torchtitan_npu.distributed.context_parallel.ulysses_cp`；注意力侧为 `torchtitan.models.attention.ScaledDotProductAttentionWrapper` |
+| 模型           | CP 分支          | 实现模块（本文件引用）                                                                                                                   |
+| ------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| DeepSeek V32 | **DSA** 分支     | `torchtitan_npu.distributed.context_parallel.dsa_cp`；注意力侧为 `DSV32_SDPA`（`torchtitan_npu.models.deepseek_v32.model.model`）     |
+| DeepSeek V3  | **Ulysses** 分支 | `torchtitan_npu.distributed.context_parallel.ulysses_cp`；注意力侧为 `torchtitan.models.attention.ScaledDotProductAttentionWrapper` |
 
 本文件在单测中分别验证：**DSA CP** 下的序列 all-gather、DTensor 梯度、`DSV32_SDPA` 的 patch 与 `dsa_forward_with_cp` 入参校验；**Ulysses CP** 下的 `all_to_all`、`ScaledDotProductAttentionWrapper` 的 patch 与 Ulysses 配置校验。
 
