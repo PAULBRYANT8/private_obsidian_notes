@@ -1,5 +1,3 @@
-# DeepSeekV4 PP 通用修复方案
-
 记录时间：2026-05-13
 
 本文记录 DeepSeekV4 开启 Pipeline Parallel(PP) 后暴露的两类问题，以及一套可支持任意 `pp` 度数的通用修改方案。当前方案先聚焦 `num_mtp_modules = 0` 的 PP 正确性；`MTP + PP` 需要额外传递 `mtp_input_offsets`，建议作为后续独立改造。

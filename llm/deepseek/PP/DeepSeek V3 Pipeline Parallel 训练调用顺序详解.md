@@ -1,5 +1,3 @@
-# DeepSeek V3 Pipeline Parallel 训练调用顺序详解
-
 **配置约定**：本文以 `n_layers=16, pp=2（即 pp_degree=2，pp_rank=0 和 pp_rank=1）` 为例。
 若未特别说明，采用默认 1F1B 单阶段调度（`PipelineSchedule1F1B`）。
 

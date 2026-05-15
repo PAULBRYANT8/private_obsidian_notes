@@ -1,5 +1,3 @@
-# DeepSeekV4 PP + MTP 报错分析与修复方案
-
 记录时间：2026-05-13
 
 本文整理 `deepseek_v4_285b_43layers_4k_128die.toml` 在开启 Pipeline Parallel(PP) 和 MTP 后遇到的几类报错，包括日志现象、根因分析、当前修改是否有效，以及最终建议的完整修复方案。
