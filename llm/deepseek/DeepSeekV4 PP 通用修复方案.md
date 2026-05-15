@@ -386,6 +386,8 @@ def generate_deepseek_v4_fqn_per_model_part(
     return module_names_per_stage
 ```
 
+上面的切分方式会把 `tok_embeddings` 视为 first_stage 的一个权重，`hc_head/norm/output` 视为 last_stage 的一个权重。以 16 层模型为例，当 pp=2，(16 + 1 + 1) // 4 = 4，extra = 2，那么前两个 stage 就会每一个 stage 多一个权重。stage0 包含 `tok_embeddings, layers.0, layers.1, layers.2, layers.3` ，stage1 包含 `layers.4, layers.5, layers.6, layers.7, layers.8` ，stage2 包含 `layers.9, layers.10, layers.11, layers.12` ，stage3 包含 `layers.13, layers.14, layers.15, hc_head, nrom, output` 。
+
 这样做比在 toml 中手写 stage 列表更稳。手写方式只能解决某一个固定 `pp/schedule/n_layers` 场景；一旦 `pp=4`、schedule 变化、层数变化，手写列表就会失效。自动生成函数可以保证：
 
 ```text
