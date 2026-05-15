@@ -240,8 +240,9 @@ h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 ```
 
 非 last stage 返回时，`input_ids` 建议以 `float32` sidecar 形式传输：
-说明：用 float32 不是为了数值计算，而是为了适配 PyTorch Pipeline 的 backward 通信机制。input_ids 原本是 token id，正常 dtype 是：'torch.long / int64'。但在 PP 中，非 last stage 返回：'return h, input_ids'。
-PyTorch Pipeline 会把 tuple 里的每个 tensor 都当成 stage output，并为它建立 forward 发送、backward 回传的通信元数据。到了下游 stage，收到的 activation buffer 通常会被设成：'requires_grad_(True)'。问题是：torch.long tensor 不能 'requires_grad=True'。所以如果直接传原始 long input_ids，可能在 pipeline runtime 建 backward buffer 或设置 requires grad 时出错。即使某些路径不马上报错，反向通信时也会遇到“非浮点 tensor 没有梯度”的问题。所以我们把它作为 sidecar payload 传输时改成：'input_ids_sidecar = input_ids.detach().to(torch.float32)'。后续 stage 使用前再转回：'input_ids = input_ids_sidecar.detach().long()'
+说明：用 float32 不是为了数值计算，而是为了适配 PyTorch Pipeline 的 backward 通信机制。input_ids 原本是 token id，正常 dtype 是：`torch.long / int64`。但在 PP 中，非 last stage 返回：`return h, input_ids`。
+PyTorch Pipeline 会把 tuple 里的每个 tensor 都当成 stage output，并为它建立 forward 发送、backward 回传的通信元数据。到了下游 stage，收到的 activation buffer 通常会被设成：`requires_grad_(True)`。问题是：torch.long tensor 不能 `requires_grad=True`。所以如果直接传原始 long input_ids，可能在 pipeline runtime 建 backward buffer 或设置 requires grad 时出错。即使某些路径不马上报错，反向通信时也会遇到“非浮点 tensor 没有梯度”的问题。所以我们把它作为 sidecar payload 传输时改成：`input_ids_sidecar = input_ids.detach().to(torch.float32)`。后续 stage 使用前再转回：`input_ids = input_ids_sidecar.detach().long()`。
+当前不建议把 input_ids 直接作为 torch.long 的 pipeline output 传递。PyTorch PipelineStage 会把上游 stage 的 tuple output 统一当作 activation tensor，通过位置参数传给下游 stage，并在 backward 场景下为接收 buffer 设置 requires_grad_(True)、登记梯度回传信息。torch.long tensor 不能参与 autograd，因此直接传原始 input_ids 会在接收 buffer 建图或反向梯度通信阶段出错。理论上可以把 input_ids 作为 kwargs 传给每个 stage，这样它不作为 pipeline activation，不需要 requires_grad，可以保持 torch.long。但 PyTorch 当前的跨 stage activation 传递只走位置参数，kwargs 不会从上游 stage output 自动传到下游 stage；kwargs 只能由 pipeline schedule 外部显式注入到每个 stage。因此该方案需要改调度层和数据分发逻辑，保证每个 PP rank 都能拿到当前 microbatch 的真实 input_ids。所以当前 PP-only 修复选择更小改动的方案：首 stage 将 input_ids 转为 float32 sidecar，随 activation payload 一起传递，后续 stage 使用前再转回 long。由于 DeepSeekV4 的 vocab id 范围远小于 float32 可精确表示的整数范围，该转换不会丢失 token id 信息。
 ```python
 return h, input_ids_sidecar.to(torch.float32)
 ```
