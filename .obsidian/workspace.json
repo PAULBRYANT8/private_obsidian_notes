@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/未命名 1.md",
+                "file": "llm/deepseek/未命名 2.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "未命名 1"
+              "title": "未命名 2"
             }
           }
         ],
@@ -167,13 +167,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/未命名 1.md",
+                "file": "llm/deepseek/未命名 2.md",
                 "followCursor": false,
                 "showSearch": true,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "未命名 1 的大纲"
+              "title": "未命名 2 的大纲"
             }
           },
           {
@@ -207,8 +207,9 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
-    "llm/deepseek/补充知识.md",
     "llm/deepseek/未命名 1.md",
+    "llm/deepseek/未命名 2.md",
+    "llm/deepseek/补充知识.md",
     "llm/deepseek/PP/DeepSeekV4 PP 通用修复方案.md",
     "llm/deepseek/PP/DeepSeek V3 Pipeline Parallel 训练调用顺序详解.md",
     "llm/deepseek/PP/deepseek_v4 概念汇总.md",
