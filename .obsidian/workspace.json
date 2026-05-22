@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/PP/DeepSeekV4 PP 通用修复方案.md",
+                "file": "llm/deepseek/未命名 1.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "DeepSeekV4 PP 通用修复方案"
+              "title": "未命名 1"
             }
           }
         ],
@@ -167,13 +167,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/PP/DeepSeekV4 PP 通用修复方案.md",
+                "file": "llm/deepseek/未命名 1.md",
                 "followCursor": false,
                 "showSearch": true,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "DeepSeekV4 PP 通用修复方案 的大纲"
+              "title": "未命名 1 的大纲"
             }
           },
           {
@@ -207,16 +207,17 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
+    "llm/deepseek/补充知识.md",
+    "llm/deepseek/未命名 1.md",
+    "llm/deepseek/PP/DeepSeekV4 PP 通用修复方案.md",
     "llm/deepseek/PP/DeepSeek V3 Pipeline Parallel 训练调用顺序详解.md",
     "llm/deepseek/PP/deepseek_v4 概念汇总.md",
-    "llm/deepseek/PP/DeepSeekV4 PP 通用修复方案.md",
     "llm/deepseek/PP",
     "llm/deepseek/deepseek_v4 C1A_C4A_C128A 对比.md",
     "llm/deepseek/deepseek_v3 cp.md",
     "llm/deepseek/cp 切分中部分场景详细说明.md",
     "llm/deepseek/deepseek-v4 cp实现.md",
     "llm/deepseek/DeepSeek-2026 CP 切分设计方案.md",
-    "llm/deepseek/补充知识.md",
     "llm/deepseek/未命名.md",
     "llm/deepseek/test_cp.py 单元测试总结.md",
     "1.pub",
