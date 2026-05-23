@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/TP + MTP + model compile 触发 AsyncCollectiveTensor tangent 类型不匹配问题记录.md",
+                "file": "llm/deepseek/未命名.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "TP + MTP + model compile 触发 AsyncCollectiveTensor tangent 类型不匹配问题记录"
+              "title": "未命名"
             }
           }
         ],
@@ -167,13 +167,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/TP + MTP + model compile 触发 AsyncCollectiveTensor tangent 类型不匹配问题记录.md",
+                "file": "llm/deepseek/未命名.md",
                 "followCursor": false,
                 "showSearch": true,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "TP + MTP + model compile 触发 AsyncCollectiveTensor tangent 类型不匹配问题记录 的大纲"
+              "title": "未命名 的大纲"
             }
           },
           {
@@ -207,8 +207,8 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
-    "llm/deepseek/未命名 1.md",
     "llm/deepseek/TP + MTP + model compile 触发 AsyncCollectiveTensor tangent 类型不匹配问题记录.md",
+    "llm/deepseek/未命名 1.md",
     "llm/deepseek/补充知识.md",
     "llm/deepseek/PP/DeepSeekV4 PP 通用修复方案.md",
     "llm/deepseek/PP/DeepSeek V3 Pipeline Parallel 训练调用顺序详解.md",
