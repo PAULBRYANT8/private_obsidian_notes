@@ -23,7 +23,7 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "llm/deepseek/未命名.md",
+                "file": "执行命令/未命名.md",
                 "mode": "source",
                 "source": false
               },
@@ -167,7 +167,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "llm/deepseek/未命名.md",
+                "file": "执行命令/未命名.md",
                 "followCursor": false,
                 "showSearch": true,
                 "searchQuery": ""
@@ -207,6 +207,8 @@
   },
   "active": "0d444d1a58c4cbc1",
   "lastOpenFiles": [
+    "llm/deepseek/未命名.md",
+    "执行命令/未命名.md",
     "llm/deepseek/TP + MTP + model compile 触发 AsyncCollectiveTensor tangent 类型不匹配问题记录.md",
     "llm/deepseek/未命名 1.md",
     "llm/deepseek/补充知识.md",
@@ -219,7 +221,6 @@
     "llm/deepseek/cp 切分中部分场景详细说明.md",
     "llm/deepseek/deepseek-v4 cp实现.md",
     "llm/deepseek/DeepSeek-2026 CP 切分设计方案.md",
-    "llm/deepseek/未命名.md",
     "llm/deepseek/test_cp.py 单元测试总结.md",
     "1.pub",
     "1",
