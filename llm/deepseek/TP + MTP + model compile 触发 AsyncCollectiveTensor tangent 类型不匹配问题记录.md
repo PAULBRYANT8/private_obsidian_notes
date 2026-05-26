@@ -433,3 +433,295 @@ python3 -m compileall torchtitan_npu/patches/torch/functional_collectives.py tor
 
 - PyTorch issue #172556: https://github.com/pytorch/pytorch/issues/172556
 - PyTorch issue #173123: https://github.com/pytorch/pytorch/issues/173123
+
+# MTP + TP + Compile 场景下的 wait() 修复方案
+
+## 本次遇到的报错
+
+触发条件：
+
+- DeepSeek-V4
+- `tp=2`
+- `compile.enable=true`
+- `compile.components` 包含 `"model"`
+- `num_mtp_modules=1`
+
+旧日志中的核心报错为：
+
+```text
+During the backward, we encountered a tensor subclass where we guessed its
+metadata incorrectly.
+
+Expected metadata: None, expected type: <class 'torch.distributed._functional_collectives.AsyncCollectiveTensor'>
+
+Runtime metadata: None, runtime type: <class 'torch.Tensor'>
+
+shape: torch.Size([1, 2048, 4096])
+```
+
+这个报错发生在 AOTAutograd backward 的 `process_runtime_tangent` 阶段。含义是：编译阶段记录某个 backward tangent 应该是 `AsyncCollectiveTensor`，但运行时实际拿到的是普通 `torch.Tensor`。二者 metadata 都是 `None`，真正不一致的是 tensor subclass 类型。
+
+## 报错位置对应的张量
+
+对比 MTP=0 和 MTP=1 的 debug 日志后，最关键的差异出现在 MTP 额外层 `layers.43`：
+
+```text
+layers.43.enorm fwd_in
+```
+
+在使用 `_functional_collectives.py` patch 的旧 MTP=1 日志中：
+
+```text
+[MTP_TP_COMPILE_DEBUG][fwd_in][layers.43.enorm]
+type=torch.distributed._functional_collectives.AsyncCollectiveTensor
+shape=(1, 512, 4096)
+```
+
+在使用 `wait()` 方案的新 MTP=1 日志中：
+
+```text
+[MTP_TP_COMPILE_DEBUG][fwd_in][layers.43.enorm]
+type=torch.Tensor
+shape=(1, 512, 4096)
+```
+
+旧报错中的 shape 是 `[1, 2048, 4096]`，新 debug 配置中是 `[1, 512, 4096]`。两者结构相同，都是 TP=2 后本地 sequence shard 的 hidden tensor，差异来自不同运行配置的 sequence length。
+
+## 为什么 MTP=0 没有触发
+
+MTP=0 时，主干路径在 `tok_embeddings` 后继续进入普通 transformer 主干。日志中没有发现 `AsyncCollectiveTensor` 直接进入 MTP 专属 `enorm` 的情况。
+
+MTP=1 时，模型 forward 多了这一段：
+
+```python
+token_offset = tokens[:, token_offset_id:token_end_idx]
+input_offset = self.tok_embeddings(token_offset)
+h = self.layers[str(layer_id)](
+    input_offset,
+    prev_embed,
+    ...
+)
+```
+
+其中 `self.layers[str(layer_id)]` 是 MTPModule，第一步就是：
+
+```python
+input_offset = self.enorm(input_offset)
+```
+
+`tok_embeddings` 在 TP 下使用 RowwiseParallel，输出 layout 是 `Shard(1)`。在 MTP=1 + model compile 场景中，这个输出的本地 shard 可能以 `AsyncCollectiveTensor` 形式进入 `layers.43.enorm` 的 compiled boundary，于是 AOTAutograd 编译期和运行期对 tangent 类型的判断可能不一致。
+
+## 两种修复思路
+
+### 方案一：patch functional_collectives
+
+这个方案在 `torchtitan_npu/patches/torch/functional_collectives.py` 中补齐 `torch.Tensor` 和 `AsyncCollectiveTensor` 的 `__coerce_same_metadata_as_tangent__` 兼容逻辑。
+
+它解决的是：
+
+```text
+expected=AsyncCollectiveTensor, runtime=torch.Tensor
+```
+
+这种类型不一致出现后，AOTAutograd 如何把二者视为等价 tangent。
+
+优点：
+
+- 直接命中报错本身。
+- 不改变模型 forward 中 collective 的等待时机。
+- 对已有异步通信 overlap 更友好。
+
+缺点：
+
+- 属于 monkey patch PyTorch tensor subclass 行为。
+- 需要持续关注后续 PyTorch 版本是否已经内置该逻辑。
+
+### 方案二：在 MTP + compile 场景提前 wait
+
+这个方案不等报错发生后再做 coercion，而是在 MTP 分支进入 compiled `enorm` 前，让 `tok_embeddings` 的 Rowwise 输出稳定成普通 `torch.Tensor`。
+
+本次修改位置在 `torchtitan_npu/models/deepseek_v4/infra/parallelize.py`。
+
+新增 helper：
+
+```python
+_ASYNC_COLLECTIVE_TENSOR_MODULE = "torch.distributed._functional_collectives"
+_ASYNC_COLLECTIVE_TENSOR_NAME = "AsyncCollectiveTensor"
+
+
+def _is_async_collective_tensor(value) -> bool:
+    value_type = type(value)
+    return (
+        value_type.__module__ == _ASYNC_COLLECTIVE_TENSOR_MODULE
+        and value_type.__name__ == _ASYNC_COLLECTIVE_TENSOR_NAME
+    )
+
+
+def _wait_async_collective_tensor(value):
+    if _is_async_collective_tensor(value):
+        return value.wait()
+    return value
+```
+
+修改 `AwaitRowwiseParallel` 的输出处理：
+
+```python
+class AwaitRowwiseParallel(RowwiseParallel):
+    @staticmethod
+    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        if outputs.placements != output_layouts:
+            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+
+        if use_local_output:
+            return _wait_async_collective_tensor(outputs.to_local())
+
+        real_tensor = outputs._local_tensor
+        if _is_async_collective_tensor(real_tensor):
+            real_tensor.wait()
+        else:
+            torch.ops._c10d_functional.wait_tensor(real_tensor)
+        return outputs
+```
+
+仅在 MTP + model compile 时启用：
+
+```python
+model_compile_enabled = (
+    job_config.compile.enable and "model" in job_config.compile.components
+)
+await_mtp_embedding_output = (
+    model_compile_enabled and model.model_args.num_mtp_modules > 0
+)
+embedding_rowwise_parallel = (
+    await_rowwise_parallel if await_mtp_embedding_output else rowwise_parallel
+)
+if await_mtp_embedding_output:
+    logger.info(
+        "Waiting tok_embeddings RowwiseParallel output for DeepSeek-V4 MTP compile"
+    )
+```
+
+然后将 `tok_embeddings` 从固定 `RowwiseParallel` 改为条件选择：
+
+```python
+"tok_embeddings": embedding_rowwise_parallel(
+    input_layouts=Replicate(),
+    output_layouts=Shard(1),
+),
+```
+
+这样修改后，只有以下场景会走 wait 版本：
+
+```text
+compile.enable == true
+and "model" in compile.components
+and num_mtp_modules > 0
+```
+
+MTP=0、不开 compile、只 compile loss 的场景不受影响。
+
+## 为什么使用 wait() 而不是 .elem
+
+`AsyncCollectiveTensor` 是 functional collective 返回的 wrapper subclass。它内部有底层 tensor：
+
+```python
+AsyncCollectiveTensor.elem
+```
+
+直接使用 `.elem` 确实可以拿到普通 `torch.Tensor`，但它不是推荐修复方式。
+
+风险：
+
+1. `.elem` 只是剥掉 wrapper，不保证显式执行 `wait_tensor`。
+2. 它绕过了 `AsyncCollectiveTensor.__torch_dispatch__` 中的正常等待逻辑。
+3. `.elem` 是 PyTorch 内部实现细节，不是稳定 API。
+4. 日志中可以看到 ACT 外层 `requires_grad=True`，但 `elem` 显示 `requires_grad=False`，直接取 `.elem` 更容易引入 autograd 语义风险。
+
+`wait()` 是该 wrapper 设计出来的 materialize 方式：
+
+```python
+def wait(self) -> torch.Tensor:
+    return wait_tensor(self.elem)
+```
+
+因此更安全的语义是：
+
+```text
+AsyncCollectiveTensor
+-> wait async collective 完成
+-> 返回普通 torch.Tensor
+```
+
+而不是：
+
+```text
+AsyncCollectiveTensor
+-> 直接取内部 elem
+-> 绕过 wrapper 等待语义
+```
+
+## 两份日志的对比结论
+
+对比日志：
+
+- `_functional_collectives.py` patch 方案：
+  `5x16_v022_deepseek_v4_tp_test/v022_deepseek_v4_43layers_tp2_mtp1_af_20260525143021.log`
+- `wait()` 方案：
+  `5x16_v022_deepseek_v4_tp_test/v022_deepseek_v4_43layers_tp2_mtp1_af_20260525153229.log`
+
+关键信息：
+
+```text
+143021.log: AsyncCollectiveTensor 出现 8 次
+153229.log: AsyncCollectiveTensor 出现 0 次
+```
+
+`layers.43.enorm fwd_in` 对比：
+
+```text
+143021.log: type=torch.distributed._functional_collectives.AsyncCollectiveTensor
+153229.log: type=torch.Tensor
+```
+
+两份日志都训练完成：
+
+```text
+Training completed
+```
+
+step 10 指标接近：
+
+```text
+143021.log loss:      13.37783
+153229.log loss:      13.37789
+
+143021.log grad_norm:  8.5247
+153229.log grad_norm:  8.5259
+```
+
+稳定 step 的性能没有观察到明显变慢。step 2-10 粗略平均：
+
+```text
+143021.log: 约 8.95s/step
+153229.log: 约 8.73s/step
+```
+
+注意：`153229.log` 的 step 1 明显更慢：
+
+```text
+step 1 elapsed_time_per_step: 450.259s
+```
+
+这更像首次 compile/CANN 编译缓存差异，不应直接归因于 `wait()`。
+
+## 最终建议
+
+当前更推荐保留 `wait()` 方案作为 DeepSeek-V4 MTP + TP + model compile 的局部修复：
+
+1. 修改范围收窄在 `tok_embeddings` 的 Rowwise 输出。
+2. 只在 MTP + model compile 场景生效。
+3. 不改变 MTP 计算公式、不改变 loss 逻辑、不改变下游 DTensor layout。
+4. 从 debug 日志看，能把 `layers.43.enorm` 入口从 ACT 稳定为普通 Tensor。
+5. 从短跑日志看，loss/grad_norm 对齐，稳定 step 性能没有明显退化。
+
+如果后续需要追求最大通信 overlap，可以继续评估 `_functional_collectives.py` patch 方案；如果追求更少 monkey patch 和更明确的局部行为，`wait()` 方案更容易维护。
